@@ -1969,6 +1969,70 @@ async def api_artifact_delete(request: web.Request) -> web.Response:
         # reaches the delete() call below, which returns a clean 4xx (a bare
         # ArtifactNotFoundError catch here would leak ArtifactValidationError as a 500).
         _existing = None
+    # Withdraw the destination copy BEFORE the local delete, so the publication -- the
+    # only handle that can withdraw it -- still exists while the attempt is made. The
+    # reverse order was tried and reverted twice; this ordering is the one with the
+    # smaller crash residue. Die between the two steps here and the copy is withdrawn but
+    # the artifact remains, which the user simply deletes again. Die between them in the
+    # other order and the record is already gone while the content is still public, with
+    # nothing left to withdraw it by.
+    #
+    # The outcome decides whether the local delete may proceed, keyed on whether a RETRY
+    # of the withdrawal is meaningful. A destination that is gone for good (unregistered,
+    # or unreachable: credentials revoked / account closed) yields UNREACHABLE -- the
+    # documented escape hatch that strict `unpublish` points users at -- so the delete
+    # proceeds and only a log line is left; aborting there would make a user's own delete
+    # hostage to a remote system it can never reach again. But a destination that is
+    # reachable and merely REJECTS the withdrawal (FAILED) keeps the publication -- the
+    # only retry handle -- so we abort the local delete and return an error, rather than
+    # drop the record and strand a public copy with nothing able to withdraw it.
+    if _existing is not None and _existing.publication is not None:
+        withdrawal = await publish_sync.delete_for_artifact(_existing)
+        if withdrawal is publish_sync.DeleteWithdrawal.FAILED:
+            msg = (
+                "The destination did not confirm removal of the published copy, so this "
+                "artifact was not deleted. Try again once the destination stops erroring."
+            )
+            _audit(
+                tool="artifact_delete",
+                request=request,
+                outcome="error",
+                error=msg,
+                extra={"slug": slug},
+            )
+            return _err(msg, status=502)
+        # The withdrawal above is a network round trip, so the slug can be deleted AND
+        # RECREATED while it runs. `delete()` below removes by slug, so a delayed request
+        # would delete the REPLACEMENT -- an artifact the user never asked to delete and
+        # that nothing can restore. The ordering note above reasons that "a save landing
+        # in that window is included in the delete the user asked for", which holds for a
+        # save to the SAME artifact; a recreate is a DIFFERENT artifact wearing the same
+        # slug, which that argument does not cover. `created_at` is minted fresh on create
+        # at microsecond precision, so it identifies the generation rather than the name.
+        # A slug that is simply GONE is not an error here: `delete()` reports that itself.
+        # Off the loop: `store.get` returns the artifact WITH content, so on a large
+        # artifact it is a multi-megabyte synchronous read, and this handler is async.
+        # `_run_off_loop` is this module's helper for exactly that and propagates the
+        # exception unchanged, so the guard below still sees `ArtifactError`.
+        try:
+            _after = await _run_off_loop(lambda: get_default_store().get(slug))
+        except ArtifactError:
+            _after = None
+        if _after is not None and _after.created_at != _existing.created_at:
+            msg = (
+                "This artifact was deleted and a new one created under the same name "
+                "while its published copy was being withdrawn. The published copy was "
+                "withdrawn; the new artifact was left alone. Delete it again if you "
+                "meant to remove the replacement too."
+            )
+            _audit(
+                tool="artifact_delete",
+                request=request,
+                outcome="denied",
+                error=msg,
+                extra={"slug": slug},
+            )
+            return _err(msg, status=409)
     try:
         get_default_store().delete(slug)
     except ArtifactNotFoundError as exc:
@@ -2459,6 +2523,60 @@ async def api_artifact_refresh_sharing(request: web.Request) -> web.Response:
         return _sync_error_response("artifact_refresh_sharing", request, slug, exc)
     _audit(
         tool="artifact_refresh_sharing",
+        request=request,
+        outcome="success",
+        extra={"slug": slug},
+    )
+    return _json_response(_serialize(art, include_content=True))
+
+
+async def api_artifact_reprobe_notice(request: web.Request) -> web.Response:
+    """POST /api/artifacts/{slug}/publish/reprobe-notice — re-check the
+    destination's serving state and clear a stale publish notice.
+
+    A publish can record a "still rolling out" ``notice`` that later resolves on
+    its own, but nothing on the happy path revisits it, so the amber banner
+    would persist forever after the link works. This re-probes the provider and
+    reconciles ``notice`` / ``notice_code`` to the current truth (clears them
+    only when the condition has actually cleared). Gated like other mutations
+    since it can update meta.json.
+    """
+    state = request.app.get("state")
+    if state is None or _is_restricted_session(state, request):
+        _audit(
+            tool="artifact_reprobe_notice",
+            request=request,
+            outcome="denied",
+            error="restricted session" if state is not None else "missing dashboard state",
+            extra={"slug": request.match_info.get("slug", "")},
+        )
+        return _err("restricted session cannot reprobe artifact notice", status=403)
+    slug = request.match_info.get("slug", "")
+    try:
+        await publish_sync.reprobe_notice(slug)
+        art = await _run_off_loop(lambda: get_default_store().get(slug))
+    except ArtifactNotFoundError as exc:
+        _audit(
+            tool="artifact_reprobe_notice",
+            request=request,
+            outcome="error",
+            error=str(exc),
+            extra={"slug": slug},
+        )
+        return _err(str(exc), status=404)
+    except ArtifactValidationError as exc:
+        _audit(
+            tool="artifact_reprobe_notice",
+            request=request,
+            outcome="denied",
+            error=str(exc),
+            extra={"slug": slug},
+        )
+        return _err(str(exc))
+    except Exception as exc:  # pragma: no cover — reprobe is best-effort
+        return _sync_error_response("artifact_reprobe_notice", request, slug, exc)
+    _audit(
+        tool="artifact_reprobe_notice",
         request=request,
         outcome="success",
         extra={"slug": slug},
@@ -4196,6 +4314,10 @@ async def api_artifact_publish_providers(request: web.Request) -> web.Response:
                 # False + present in this list ⇒ installs on first publish; the
                 # FE may surface an "installs on first use" hint.
                 "available": avail,
+                # The remedy text for `available: false`. Without it the picker can only
+                # send the user somewhere generic, and a provider's own hint is the only
+                # thing that knows WHICH action makes it available.
+                "install_hint": str(getattr(p, "install_hint", "") or ""),
                 "sharing_model": _sharing_model_dict(sm),
                 "sync_model": {
                     "authority": sy.authority,
