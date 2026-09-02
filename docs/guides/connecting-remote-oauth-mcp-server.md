@@ -168,13 +168,19 @@ kiro-cli's local callback and the token is written to disk.
 ## If the host is not recognized: the OAuth endpoint allowlist
 
 If the browser step fails **before** you ever reach the provider — the chat
-banner reports something like:
+banner reports a prose warning like:
 
 ```text
-authentication failed: URL contained credential or exfiltration pattern
+🚫 miro sent an authentication URL containing a credential pattern
+(rejected). If this is a self-hosted or otherwise unlisted identity
+provider, its authorization endpoint may need adding to oauth_endpoints.json
+in the Kiro Crew data home; otherwise ask the server owner to fix the URL.
 ```
 
-— the authorization URL was rejected by Kiro Crew's gate, not by the provider.
+(The terse string `URL contained credential or exfiltration pattern` is the
+message's `error` metadata field, not on-screen text — you will not find it by
+grepping the transcript for a visible line.) The authorization URL was rejected
+by Kiro Crew's gate, not by the provider.
 Kiro Crew scans consent URLs for credential-exfiltration patterns, and it
 relaxes the base64-blob / query-length heuristics **only** for authorization
 endpoints it recognizes by exact `(host, path)`. That recognized set is
