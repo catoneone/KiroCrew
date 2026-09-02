@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import errno
 import hashlib
@@ -1663,6 +1664,214 @@ class TestCreateAndDeletePinTheDirectory:
         assert _outcomes(mock_sel)[-1] == "blocked"
         assert (outside / "victim.md").read_text() == "SECRET"
         assert not (outside / "x.md").exists()
+
+    def test_a_create_whose_close_fails_publishes_nothing_and_stays_retryable(
+        self, tmp_path, mock_sel, monkeypatch
+    ):
+        """A DEFERRED write error cannot leave anything behind, named or not.
+
+        ``fsync`` and ``close`` are where a filesystem is entitled to first
+        report a failure it deferred -- ENOSPC once the last block is flushed,
+        EIO on a network mount -- so guarding the write loop alone does not cover
+        it. The injected failure closes the descriptor for real and then raises,
+        which is what the kernel does: POSIX leaves the descriptor's state
+        unspecified after a failed close and Linux releases it either way.
+
+        Retryability is the property under test. Anything left under the
+        prompt's own name answers every later create 409 ``prompt_exists`` over a
+        truncated body, and the API offers no way to remove a file it will not
+        admit it wrote. The empty-directory assertion is exhaustive on purpose:
+        on the unnamed path there is no temp entry to tolerate either.
+        """
+        real_fsync, real_close = os.fsync, os.close
+        failed: list[str] = []
+
+        def _fsync_fails(fd):
+            failed.append("fsync")
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(os, "fsync", _fsync_fails)
+        first = asyncio.run(
+            api_prompts_create(_create_request({"name": "half", "content": "abcdefgh"}))
+        )
+        # Restored one name at a time, NOT through ``monkeypatch.undo()``: this
+        # test and the autouse home-isolation fixture share one function-scoped
+        # monkeypatch instance, so an undo here also reverts ``Path.home`` and
+        # the retry below would create the prompt in the developer's REAL
+        # ``~/.kiro/prompts`` while these assertions read ``tmp_path``.
+        monkeypatch.setattr(os, "fsync", real_fsync)
+        monkeypatch.setattr(os, "close", real_close)
+
+        assert failed, "the flush never failed — the test would be vacuous"
+        assert first.status == 500 and json.loads(first.body)["code"] == "write_failed"
+        assert _outcomes(mock_sel)[-1] == "error"
+        assert list((tmp_path / ".kiro" / "prompts").iterdir()) == []
+
+        second = asyncio.run(
+            api_prompts_create(_create_request({"name": "half", "content": "abcdefgh"}))
+        )
+        assert second.status == 201
+        assert (tmp_path / ".kiro" / "prompts" / "half.md").read_text() == "abcdefgh"
+        assert [p.name for p in (tmp_path / ".kiro" / "prompts").iterdir()] == ["half.md"]
+
+    @pytest.mark.skipif(
+        not _prompts_mod._UNNAMED_CREATE_SUPPORTED or not os.path.isdir("/proc/self/fd"),
+        reason="platform cannot build an unnamed inode (O_TMPFILE + /proc/self/fd)",
+    )
+    def test_the_published_prompt_has_exactly_one_link(self, tmp_path, mock_sel):
+        """The prompt this handler creates is readable by its own read path.
+
+        ``safe_read_file_bytes_nolink`` refuses ``st_nlink > 1``, so a publish
+        that routes the body through a second name -- write a temp, link it into
+        place, remove the temp -- leaves a window in which a crash strands a
+        prompt that answers 403 forever. Building the inode UNNAMED and linking
+        it once means the count goes from zero to one and is never two, so there
+        is no such window and no temp to reclaim.
+        """
+        resp = asyncio.run(api_prompts_create(_create_request({"name": "solo", "content": "S"})))
+        assert resp.status == 201
+        d = tmp_path / ".kiro" / "prompts"
+        published = d / "solo.md"
+        assert published.stat().st_nlink == 1
+        assert [p.name for p in d.iterdir()] == ["solo.md"]
+        # Readable through the endpoint that enforces the link count.
+        detail = asyncio.run(api_prompt_detail(_api_request("solo")))
+        assert detail.status == 200 and json.loads(detail.body)["content"] == "S"
+
+    def test_the_capability_constant_touches_no_filesystem(self):
+        """``_UNNAMED_CREATE_SUPPORTED`` is settled by attribute lookups alone.
+
+        This module is imported on the gateway boot path, where every statement
+        runs once on one thread before the dashboard socket accepts requests --
+        so a filesystem probe here is paid by every user on every launch
+        (``no-new-work-on-gateway-boot-path``). The ``/proc/self/fd`` half of the
+        capability is a mount question, so it belongs in the write job, which
+        already runs in the executor.
+
+        Read statically off the module's own source rather than by executing it:
+        the assignment's expression may name only capability attributes and may
+        call only ``getattr``/``bool``, so putting a ``stat`` back into it fails
+        here no matter how the call is spelled.
+        """
+        tree = ast.parse(Path(_prompts_mod.__file__).read_text(encoding="utf-8"))
+        assign = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "_UNNAMED_CREATE_SUPPORTED"
+                for t in node.targets
+            )
+        )
+        reads = {
+            ast.unparse(sub) for sub in ast.walk(assign.value) if isinstance(sub, ast.Attribute)
+        }
+        calls = {
+            ast.unparse(sub.func) for sub in ast.walk(assign.value) if isinstance(sub, ast.Call)
+        }
+        assert reads <= {
+            "os.O_TMPFILE",
+            "os.link",
+            "os.supports_dir_fd",
+        }, f"boot-path constant reads more than capability attributes: {sorted(reads)}"
+        assert calls <= {
+            "getattr",
+            "bool",
+        }, f"boot-path constant calls something that may touch the filesystem: {sorted(calls)}"
+
+    def test_the_body_is_durable_before_the_name_appears(self, tmp_path, mock_sel, monkeypatch):
+        """The flush precedes the publish, and the DIRECTORY is flushed too.
+
+        201 says the prompt is on disk. Publishing first and flushing after
+        inverts that: the entry is visible, the lister shows it, and the error a
+        full or network-backed filesystem was deferring arrives afterwards --
+        reported success over a body that never landed.
+
+        Flushing only the file is the subtler half of the same promise. A
+        directory is a separate object, so an inode that is durable under a name
+        that is not comes back from a power loss with the body intact and nothing
+        pointing at it -- acknowledged, then vanished. Both flushes are the
+        contract, so the whole order is what is asserted.
+        """
+        order: list[str] = []
+        real_fsync, real_link = os.fsync, os.link
+
+        def _note_fsync(fd):
+            # Distinguish the file's flush from the directory's by asking the
+            # descriptor what it is, rather than by call order.
+            order.append("fsync_dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync_file")
+            return real_fsync(fd)
+
+        def _note_link(*a, **kw):
+            order.append("publish")
+            return real_link(*a, **kw)
+
+        monkeypatch.setattr(os, "fsync", _note_fsync)
+        monkeypatch.setattr(os, "link", _note_link)
+        resp = asyncio.run(api_prompts_create(_create_request({"name": "durable", "content": "B"})))
+        monkeypatch.setattr(os, "fsync", real_fsync)
+        monkeypatch.setattr(os, "link", real_link)
+
+        assert resp.status == 201
+        assert order[:2] == ["fsync_file", "publish"], f"flush must precede publish, got {order}"
+        assert "fsync_dir" in order, f"the directory entry was never flushed: {order}"
+        assert order.index("fsync_dir") > order.index(
+            "publish"
+        ), f"the directory flush must follow the publish it is making durable: {order}"
+        assert (tmp_path / ".kiro" / "prompts" / "durable.md").read_text() == "B"
+
+    def test_a_create_cannot_disturb_a_prompt_already_at_the_name(
+        self, tmp_path, mock_sel, monkeypatch
+    ):
+        """The publish is create-if-absent, and a failure never reaches the name.
+
+        Both halves matter, because the obvious alternative fails one or the
+        other. Writing O_EXCL straight onto the prompt's own name and unlinking
+        on failure has no way to bind the unlink to the inode it created (POSIX
+        has no unlink-by-inode, so the verify and the unlink are two syscalls on
+        one NAME), so an atomic save landing between them loses the replacement;
+        dropping that cleanup instead strands a partial body and answers every
+        retry 409 forever. Publishing an unnamed inode with ``link`` has neither
+        problem: the name appears only on success, and ``link`` refuses an
+        occupied destination rather than writing through it.
+        """
+        d = tmp_path / ".kiro" / "prompts"
+        d.mkdir(parents=True)
+        rival = d / "rival.md"
+        rival.write_text("NOT YOURS")
+        before = rival.stat()
+
+        # A create losing the race for a name someone else holds is refused, and
+        # the incumbent is untouched -- same inode, same bytes.
+        taken = asyncio.run(
+            api_prompts_create(_create_request({"name": "rival", "content": "MINE"}))
+        )
+        assert taken.status == 409 and json.loads(taken.body)["code"] == "prompt_exists"
+        assert rival.read_text() == "NOT YOURS"
+        assert (rival.stat().st_dev, rival.stat().st_ino) == (before.st_dev, before.st_ino)
+        assert [p.name for p in d.iterdir()] == ["rival.md"]
+
+        # And a create that FAILS mid-write never had the name to lose: the
+        # incumbent survives and no debris is left beside it.
+        real_write = os.write
+        failed = {"done": False}
+
+        def _fail_the_body(fd, data):
+            if data == b"MINE" and not failed["done"]:
+                failed["done"] = True
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_write(fd, data)
+
+        monkeypatch.setattr(os, "write", _fail_the_body)
+        broke = asyncio.run(
+            api_prompts_create(_create_request({"name": "rival", "content": "MINE"}))
+        )
+        monkeypatch.setattr(os, "write", real_write)
+
+        assert failed["done"], "the write never failed — the test would be vacuous"
+        assert broke.status == 500 and json.loads(broke.body)["code"] == "write_failed"
+        assert rival.read_text() == "NOT YOURS"
+        assert [p.name for p in d.iterdir()] == ["rival.md"]
 
 
 class TestARefusedUpdateIsNotReportedAsSuccess:
