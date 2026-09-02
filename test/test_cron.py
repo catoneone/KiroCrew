@@ -533,6 +533,151 @@ class TestCronService:
         assert updated.model == ""
 
 
+class TestLastResultTimestamp:
+    """``last_result_ts`` identifies WHICH run produced ``last_result``.
+
+    The dashboard injection stamps its rows from this field, so every injection
+    site for one run renders byte-identical content (keeping ``/to-chat``
+    idempotent against the executor's auto-inject) while two different runs stay
+    two distinct rows instead of collapsing into one undated pile.
+    """
+
+    def test_set_run_result_stamps_the_run(self, tmp_path: Path) -> None:
+        svc = CronService(base_dir=tmp_path)
+        svc._load()
+        job = svc.add_job(name="stamped", message="go", every_secs=300)
+        assert job.last_result_ts == 0.0
+        before = time.time()
+        job.set_run_result("output")
+        assert job.last_result_ts >= before
+
+    def test_stamp_persists(self, tmp_path: Path) -> None:
+        svc1 = CronService(base_dir=tmp_path)
+        svc1._load()
+        job = svc1.add_job(name="stamped", message="go", every_secs=300)
+        job.set_run_result("output")
+        stamped_at = job.last_result_ts
+        rendered = job.last_result_stamp
+        svc1._save()
+
+        svc2 = CronService(base_dir=tmp_path)
+        svc2._load()
+        # A later /to-chat re-surfacing reads the job back from disk and must
+        # reproduce the same stamp the run's own injection used.
+        reloaded = svc2.list_jobs()[0]
+        assert reloaded.last_result_ts == stamped_at
+        assert reloaded.last_result_stamp == rendered
+
+    def test_merge_job_result_persists_the_stamp(self, tmp_path: Path) -> None:
+        """The run-result merge is the writer a real run goes through.
+
+        ``_merge_job_result`` ``_sync()``s first, so it copies field by field
+        onto a RELOADED job object rather than saving the in-memory one. A stamp
+        left out of that copy list was never persisted for the run that produced
+        it: the disk record paired the new result with a PREVIOUS run's stamp, so
+        after a reload ``/to-chat`` rendered a header the executor never wrote
+        and ``append_if_absent`` appended a duplicate instead of collapsing onto
+        the existing row.
+        """
+        svc1 = CronService(base_dir=tmp_path)
+        svc1._load()
+        job = svc1.add_job(name="stamped", message="go", every_secs=300)
+        job.set_run_result("output")
+        svc1._merge_job_result(job)
+
+        svc2 = CronService(base_dir=tmp_path)
+        svc2._load()
+        merged = svc2.list_jobs()[0]
+        assert merged.last_result == "output"
+        assert merged.last_result_ts == job.last_result_ts
+        assert merged.last_result_stamp == job.last_result_stamp
+
+    def test_stamp_is_rendered_in_the_job_timezone_to_the_second(self) -> None:
+        """The rendered stamp is a snapshot, and it resolves to seconds.
+
+        Resolution is load-bearing rather than cosmetic: the stamp sits inside
+        the row content the dedup compares, so anything coarser merges two runs
+        that finished within the same interval.
+        """
+        job = CronJob(id="tz1", name="tz", message="go", schedule=CronSchedule(kind="every", every_secs=300))
+        job.timezone = "UTC"
+        job.set_run_result("output")
+        assert job.last_result_stamp.startswith(" | ")
+        # ' | YYYY-MM-DD HH:MM:SS UTC'
+        assert job.last_result_stamp.endswith("UTC")
+        stamped = job.last_result_stamp[len(" | "): -len(" UTC")]
+        datetime.strptime(stamped, "%Y-%m-%d %H:%M:%S")
+
+    def test_an_unknown_timezone_still_renders_via_the_utc_fallback(self) -> None:
+        """An unresolvable zone is ``_job_tz``'s own fallback, not an error.
+
+        It resolves job zone -> config zone -> UTC, so a typo'd zone yields a UTC
+        stamp rather than raising. Asserted here because the value is what later
+        rows dedup against: a run must not lose its stamp over a config typo.
+        """
+        job = CronJob(
+            id="tz2", name="tz", message="go",
+            schedule=CronSchedule(kind="every", every_secs=300),
+        )
+        job.timezone = "Not/AZone"
+        job.set_run_result("output")
+        assert job.last_result == "output"
+        assert job.last_result_stamp.endswith("UTC")
+
+    def test_an_unrenderable_epoch_degrades_to_no_stamp(self) -> None:
+        """A stamp is display-only: rendering it must never fail the run.
+
+        Falling back to the UNSTAMPED header is deliberate -- that is the
+        spelling a legacy row already carries, so the dedup stays coherent
+        instead of gaining a third variant of the same row.
+        """
+        job = CronJob(
+            id="tz3", name="tz", message="go",
+            schedule=CronSchedule(kind="every", every_secs=300),
+        )
+        # Beyond what the platform can turn into a date, which is what the
+        # renderer's except branch exists for.
+        assert job._render_run_stamp(1e300) == ""
+
+    def test_missing_in_json_defaults_zero(self, tmp_path: Path) -> None:
+        """A store written by an older build carries a result but no stamp.
+
+        Zero means "unknown" and renders the pre-stamp header, so a row already
+        on disk still dedups against its historical spelling instead of being
+        re-appended beside a stamped twin.
+        """
+        data = {
+            "version": 2,
+            "jobs": [
+                {
+                    "id": "abc123",
+                    "name": "legacy",
+                    "message": "hi",
+                    "schedule": {"kind": "every", "every_secs": 300},
+                    "last_result": "from an older build",
+                }
+            ],
+        }
+        (tmp_path / "crons.json").write_text(json.dumps(data))
+        svc = CronService(base_dir=tmp_path)
+        svc._load()
+        loaded = svc.list_jobs()[0]
+        assert loaded.last_result == "from an older build"
+        assert loaded.last_result_ts == 0.0
+        assert loaded.last_result_stamp == ""
+
+    def test_clear_carried_result_does_not_stamp(self, tmp_path: Path) -> None:
+        """Clearing a carried result is not a run producing one."""
+        svc = CronService(base_dir=tmp_path)
+        svc._load()
+        job = svc.add_job(name="stamped", message="go", every_secs=300)
+        job.last_result = "previous run's output"
+        job.clear_carried_result()
+        assert job.last_result == ""
+        assert job.last_result_ts == 0.0
+        assert job.last_result_stamp == ""
+
+
 class TestTimerRestoreOnLoad:
     """Verify that _load() restores timers for active jobs when running."""
 

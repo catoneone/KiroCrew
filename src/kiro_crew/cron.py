@@ -543,6 +543,33 @@ class CronJob:
     # had. Reset at the start of every run.
     run_never_started: bool = False
     last_result: str | None = None
+    # Epoch at which ``last_result`` was produced, written by
+    # :meth:`set_run_result` and PERSISTED. Carries the run's identity for
+    # history attribution.
+    last_result_ts: float = 0.0
+    # The run stamp as ALREADY RENDERED text, written once by
+    # :meth:`set_run_result` and PERSISTED. This is what the dashboard header
+    # displays, and it is a snapshot on purpose.
+    #
+    # The header is also the row's dedup key: ``ConversationLog.append_if_absent``
+    # judges "already persisted" by ``(role, content)``, so any injection site
+    # that RE-RENDERED the stamp would have to reproduce it byte for byte
+    # forever. Rendering reads the job's ``timezone``, which a user can edit
+    # after the run, so a re-render would silently mint a second, differently
+    # spelled copy of a row already on disk -- a duplicated run in the tab and
+    # in the replay a follow-up turn reads. Rendering once, here, is what makes
+    # every later injection (the three executor delivery paths and a later
+    # ``/to-chat`` re-surfacing) byte-identical no matter what the job's
+    # configuration has become since.
+    #
+    # DISPLAY ONLY. Row identity is ``cron_inject.run_marker``, which carries
+    # ``last_result_ts`` at full precision, so this stamp's resolution does not
+    # decide whether two runs collapse -- it is rendered for a person to read.
+    #
+    # ``""`` (a legacy job, or a store written by an older build) means
+    # "unknown" and renders the pre-stamp header unchanged, so rows already on
+    # disk keep deduping against their historical spelling.
+    last_result_stamp: str = ""
     # Runtime-only (never serialized): True once THIS run produced a result
     # via set_run_result(). For AGENT jobs ``last_result`` is a cross-run
     # context-carry field that result-less runs deliberately leave in place
@@ -616,6 +643,28 @@ class CronJob:
         """
         self.last_result = value
         self.result_produced = True
+        # Stamped and RENDERED here rather than at injection time so all of a
+        # run's injection sites emit one identical header -- see
+        # ``last_result_stamp`` for why re-rendering duplicates rows.
+        self.last_result_ts = time.time()
+        self.last_result_stamp = self._render_run_stamp(self.last_result_ts)
+
+    def _render_run_stamp(self, when_ts: float) -> str:
+        """Render *when_ts* as the header suffix, in the job's own timezone.
+
+        Display-only: a bad timezone or a bad epoch must never fail the run
+        that produced the result, so any error degrades to the UNSTAMPED header
+        -- the same spelling a legacy row carries, which keeps the dedup
+        coherent -- rather than to a half-rendered third variant.
+        """
+        if not when_ts:
+            return ""
+        try:
+            when = datetime.fromtimestamp(when_ts, tz=_job_tz(self))
+            return f" | {when:%Y-%m-%d %H:%M:%S %Z}"
+        except Exception:
+            logger.debug("Cron run stamp render failed for job %s", self.id, exc_info=True)
+            return ""
 
     def clear_carried_result(self) -> None:
         """Drop a PREVIOUS run's result when this run produced none.
@@ -1114,6 +1163,8 @@ def _job_from_record(j: dict[str, Any]) -> CronJob:
         created_ts=j.get("created_ts", 0.0),
         delete_after_run=j.get("delete_after_run", False),
         last_result=j.get("last_result"),
+        last_result_ts=j.get("last_result_ts", 0.0),
+        last_result_stamp=j.get("last_result_stamp", ""),
         context_enabled=j.get("context_enabled", False),
         agent_id=j.get("agent_id", ""),
         approval_mode=j.get("approval_mode", ""),
@@ -3673,6 +3724,15 @@ class CronService:
                 if job.auto_paused and not by_id[job.id].user_paused:
                     by_id[job.id].enabled = False
                 by_id[job.id].last_result = job.last_result
+                # Both stamp fields travel WITH last_result. _sync() above
+                # replaced this list with the disk copies, so by_id[job.id] is
+                # a different object than `job` and every field a run produces
+                # has to be copied explicitly. Omitting these persisted the new
+                # result under the PREVIOUS run's stamp, so after a reload
+                # /to-chat rendered a header the executor never wrote and
+                # append_if_absent duplicated the row instead of collapsing it.
+                by_id[job.id].last_result_ts = job.last_result_ts
+                by_id[job.id].last_result_stamp = job.last_result_stamp
                 by_id[job.id].last_posted_hash = job.last_posted_hash
                 by_id[job.id].consecutive_dupes = job.consecutive_dupes
                 by_id[job.id].last_posted_at = job.last_posted_at
@@ -4265,6 +4325,8 @@ class CronService:
                     "created_ts": j.created_ts,
                     "delete_after_run": j.delete_after_run,
                     "last_result": j.last_result,
+                    "last_result_ts": j.last_result_ts,
+                    "last_result_stamp": j.last_result_stamp,
                     "context_enabled": j.context_enabled,
                     "agent_id": j.agent_id,
                     "approval_mode": j.approval_mode,
