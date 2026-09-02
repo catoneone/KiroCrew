@@ -886,6 +886,34 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
     return results
 
 
+def _first_tool_input_denial(
+    strings: list[str],
+    denied_regexes: list[str] | None,
+) -> tuple[str, str, str] | None:
+    """Return the first tool_input denial among *strings*, or ``None``.
+
+    Pure, synchronous, and blocking: the three predicates are regex-heavy and
+    ``_extract_tool_input_strings`` hands over EVERY string in the payload, so a
+    single long document body can occupy this loop for seconds. It therefore
+    runs on a worker thread (one hop for the whole loop, not one per string) so
+    the asyncio event loop keeps servicing its watchdog while the scan proceeds.
+
+    The tuple is ``(kind, reason, matched_string)`` where *kind* is
+    ``"path"`` / ``"bash"`` / ``"regex"``. Mechanism classification stays with
+    the caller on the event loop, because it consults the HookManager.
+    """
+    for s in strings:
+        if is_sensitive_path(s):
+            return ("path", f"Blocked: sensitive path in tool_input: {s}", s)
+        _input_bash = is_sensitive_bash_command(s)
+        if _input_bash:
+            return ("bash", _input_bash, s)
+        _input_deny = is_denied(s, denied_regexes=denied_regexes)
+        if _input_deny:
+            return ("regex", _input_deny, s)
+    return None
+
+
 # ── Tool Approval Policies ──
 
 
@@ -2046,29 +2074,25 @@ async def _resolve_permission(
     if _tool_input:
         # Extract string values from JSON tool_input for path/command checking.
         _input_strings = _extract_tool_input_strings(_tool_input)
-        for s in _input_strings:
-            if is_sensitive_path(s):
-                await provider.reject_tool(event.request_id)
-                _log(
-                    "denied",
-                    error=f"Blocked: sensitive path in tool_input: {s}",
-                    metadata={"mechanism": "always_deny_input"},
-                )
-                return False
-            _input_bash = is_sensitive_bash_command(s)
-            if _input_bash:
-                await provider.reject_tool(event.request_id)
-                _log("denied", error=_input_bash, metadata={"mechanism": "always_deny_input"})
-                return False
-            _input_deny = is_denied(s, denied_regexes=_denied_regexes)
-            if _input_deny:
-                await provider.reject_tool(event.request_id)
-                _log(
-                    "denied",
-                    error=_input_deny,
-                    metadata={"mechanism": _regex_deny_mechanism(s, "always_deny_input")},
-                )
-                return False
+        # Offloaded: the scan is regex-heavy over every string in the payload,
+        # so a large document body would block the event loop past its watchdog
+        # and take the gateway down. One hop for the whole loop.
+        _hit = await asyncio.to_thread(_first_tool_input_denial, _input_strings, _denied_regexes)
+        if _hit is not None:
+            _kind, _reason, _matched = _hit
+            await provider.reject_tool(event.request_id)
+            _log(
+                "denied",
+                error=_reason,
+                metadata={
+                    "mechanism": (
+                        _regex_deny_mechanism(_matched, "always_deny_input")
+                        if _kind == "regex"
+                        else "always_deny_input"
+                    )
+                },
+            )
+            return False
 
     if policy == ToolApprovalPolicy.HOOK_BASED and hooks:
         tool_result = hooks.on_tool_call(
