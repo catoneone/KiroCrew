@@ -254,9 +254,17 @@ jobs:
               --body "$BODY" 2>&1)" || rc=$?
             printf '%s\n' "$out"
             if [ "$rc" -ne 0 ]; then
+              # The label patterns below cover the guard's OWN failure mode: if
+              # `gh label create` above was genuinely refused (not the benign
+              # "already exists" case), the `|| echo` swallowed it and control
+              # reached here, so `gh issue create --label ratchet-audit` fails
+              # for a missing/unaddable label rather than for issues being
+              # disabled. That is the same class of write refusal, so treat it
+              # the same: emit ::notice:: and exit 1 so drift stays visible on
+              # the commit instead of the job reding on the raw rc.
               case "$out" in
-                *"not permitted"*|*"Resource not accessible by integration"*|*"issues are disabled"*|*"Issues has been disabled"*)
-                  echo "::notice::Main ratchet drift detected at $COMMIT_SHA but this workflow may not open issues in this repository. Failed lanes:$FAILED  Run: $RUN_URL"
+                *"not permitted"*|*"Resource not accessible by integration"*|*"issues are disabled"*|*"Issues has been disabled"*|*"could not add label"*|*"label"*"not found"*|*"not found"*"label"*)
+                  echo "::notice::Main ratchet drift detected at $COMMIT_SHA but this workflow may not open issues (or provision the ratchet-audit label) in this repository. Failed lanes:$FAILED  Run: $RUN_URL"
                   # Still fail the run so the drift verdict is visible on the
                   # commit even when the durable issue cannot be created.
                   exit 1
