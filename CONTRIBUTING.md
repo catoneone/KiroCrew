@@ -530,8 +530,9 @@ we never make a known problem worse, and every PR either holds the line or pays
 some of it down. A few examples (`.github/workflows/ci.yml` stays canonical for
 the full list, so this is illustration, not an inventory):
 
-- the frontend eslint warning **ceiling**, `npx eslint src/ --max-warnings 597`
-  in the frontend-lint job (fails if warnings climb above the recorded number);
+- the frontend eslint warning **ceiling**, `npx eslint src/ --max-warnings <N>`
+  in the frontend-lint job, where `<N>` is the recorded ceiling (fails if
+  warnings climb above that number; ci.yml holds the current value);
 - the black formatting **baseline** and the config-baseline snapshot
   (`config-baseline.json`, checked by `test/test_config_baseline.py`);
 - the gate-side log-site census in `test/test_security_posture.py`, which pins

@@ -38,6 +38,12 @@ name: Main Ratchet Audit
 # The gate commands below are copied byte-for-byte from ci.yml's backend-lint
 # and frontend-lint jobs so the audit and the PR gates cannot drift. If ci.yml
 # changes a gate command or the eslint --max-warnings ceiling, mirror it here.
+# This duplication (the command list and the ceiling value) is accepted and
+# guarded by comment only: extracting a single source of truth shared with
+# ci.yml is out of scope for this change. The one place the number is NOT
+# repeated is the contributor doc: CONTRIBUTING.md describes the ceiling
+# generically (it points at ci.yml for the current value) so the prose cannot
+# go stale independently of the workflow.
 
 on:
   push:
@@ -188,21 +194,40 @@ jobs:
           MARKER="<!-- main-ratchet-audit-tracking-issue -->"
           TITLE="Main ratchet drift detected"
 
-          # Which needed jobs failed? (result is success | failure | cancelled | skipped)
-          # Each failed lane is one Markdown bullet, joined with real newlines
+          # Which needed jobs did NOT succeed? (result is
+          # success | failure | cancelled | skipped). Anything other than an
+          # explicit `success` is treated as drift: a `cancelled` result (whole-
+          # workflow cancel, or the timeout-minutes cap firing) is an UNKNOWN
+          # verdict, not a green one, so it must not fall through to the all-
+          # green branch and close an open tracking issue -- that would turn an
+          # unknown into a false all-clear and erase a live drift record. Each
+          # non-success lane is one Markdown bullet, joined with real newlines
           # via printf so the body is a proper list.
           FAILED=""
-          if [ "$RATCHET_RESULT" = "failure" ]; then
+          if [ "$RATCHET_RESULT" != "success" ]; then
             FAILED="$(printf '%s\n- `ratchet-gates` (backend black/subprocess/agent-sdk/sync-io/lockdown + census & config-baseline): **%s**' "$FAILED" "$RATCHET_RESULT")"
           fi
-          if [ "$FRONTEND_RESULT" = "failure" ]; then
-            FAILED="$(printf '%s\n- `frontend-ceiling` (eslint --max-warnings 597): **%s**' "$FAILED" "$FRONTEND_RESULT")"
+          if [ "$FRONTEND_RESULT" != "success" ]; then
+            FAILED="$(printf '%s\n- `frontend-ceiling` (eslint warning ceiling): **%s**' "$FAILED" "$FRONTEND_RESULT")"
           fi
 
-          # Find an already-open tracking issue by the hidden marker (title is a
-          # convenience; the marker is authoritative). --search matches the body.
+          # The tracking issue is scoped by a dedicated label so the query is
+          # deterministic. Do NOT search the body by the marker: GitHub's issue
+          # SEARCH index is eventually consistent, so two closely-spaced drift
+          # pushes could each miss the other's freshly-created issue and open
+          # duplicates. `gh issue list --label ... --state open` reads the issues
+          # API directly (not the search index) and taking the first match keeps
+          # the single-tracking-issue invariant. The label must exist first or
+          # both this list and the create below error for the wrong reason;
+          # ensure it idempotently. --force makes "already exists" a no-op so a
+          # benign re-create is not fatal.
+          gh label create ratchet-audit --repo "$REPO" --force \
+            --color BFD4F2 \
+            --description "Main Ratchet Audit: tracking issue for ratchet/ceiling/baseline drift on main" \
+            || echo "::notice::Could not ensure the ratchet-audit label (continuing); it may already exist or label writes may be refused."
+
           EXISTING="$(gh issue list --repo "$REPO" --state open --label ratchet-audit \
-            --search "$MARKER in:body" --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+            --json number --jq '.[0].number // empty' 2>/dev/null || true)"
 
           if [ -n "$FAILED" ]; then
             BODY="$(printf '%s\n\nMain ratchet/ceiling drift was detected on the integrated tree at \`%s\`.\n\nFailed lanes:%s\n\nRun: %s\n\nWhy this matters: these gates guard against drift that would otherwise surface on an UNRELATED pull request (a PR runs against merge(branch, main) and inherits main'\''s state). Fix the drift on main rather than raising the ceiling in someone else'\''s PR. See CONTRIBUTING.md for the ratchet/ceiling/baseline path.\n\nThis issue is maintained automatically by the Main Ratchet Audit workflow; it will be closed on the next all-green push.' \
