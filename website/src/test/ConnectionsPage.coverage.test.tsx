@@ -262,6 +262,33 @@ describe('the provider gallery', () => {
     expect(within(notion).getByRole('button', { name: 'Connect' })).toBeEnabled()
   })
 
+  it('shows each provider registry warning before connection, including GitLab prerequisites', async () => {
+    mount()
+
+    await waitFor(() => expect(cards()).toHaveLength(CONNECTION_PROVIDERS.length))
+    for (const provider of CONNECTION_PROVIDERS) {
+      const guidance = within(card(provider.slug)).getByRole('note', { name: 'Before you connect' })
+      expect(within(guidance).getByText(provider.gotcha_copy)).toHaveAttribute('lang', 'en')
+    }
+
+    const gitlab = CONNECTION_PROVIDERS.find(provider => provider.slug === 'gitlab')
+    expect(gitlab).toBeDefined()
+    const gitlabGuidance = within(card('gitlab')).getByRole('note', { name: 'Before you connect' })
+    expect(gitlabGuidance).toHaveTextContent(gitlab?.gotcha_copy ?? '__missing_gitlab_copy__')
+    expect(gitlabGuidance).toHaveTextContent('GitLab Duo availability')
+    expect(gitlabGuidance).toHaveTextContent('beta and experimental features')
+    expect(gitlabGuidance).toHaveTextContent('top-level group')
+  })
+
+  it('hides prerequisite guidance once the provider is connected', async () => {
+    mcpServers.mockResolvedValue([server()])
+    mount()
+
+    const notion = await waitFor(() => card('notion'))
+    expect(notion).toHaveAttribute('data-state', 'connected')
+    expect(within(notion).queryByRole('note', { name: 'Before you connect' })).not.toBeInTheDocument()
+  })
+
   it('renders a skeleton while the server list is in flight, then the cards', async () => {
     const pending = deferred<McpServer[]>()
     mcpServers.mockReturnValue(pending.promise)

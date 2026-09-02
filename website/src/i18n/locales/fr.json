@@ -9592,6 +9592,7 @@
     "connectionsPage": {
       "action_failed": "Échec de l’action : {{error}}",
       "authorize": "Autoriser",
+      "before_you_connect": "Avant la connexion",
       "cancel": "Annuler",
       "complete_connection": "Terminer",
       "connect": "Connecter",

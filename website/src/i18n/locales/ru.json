@@ -9737,6 +9737,7 @@
     "connectionsPage": {
       "action_failed": "Не удалось выполнить действие: {{error}}",
       "authorize": "Авторизовать",
+      "before_you_connect": "Перед подключением",
       "cancel": "Отмена",
       "complete_connection": "Завершить",
       "connect": "Подключить",

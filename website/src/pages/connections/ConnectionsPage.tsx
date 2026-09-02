@@ -661,14 +661,29 @@ function ConnectionCard({
 
       <div className="mt-auto">
         {state === 'not-connected' && (
-          <div className="flex items-center justify-between gap-3">
-            <a href={provider.docs_url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-[12px] text-muted hover:text-text">
-              {t('pages.connectionsPage.documentation')} <ExternalLink className="w-3 h-3" aria-hidden="true" />
-            </a>
-            <Btn primary onClick={() => void startMint(onConnect)} disabled={!!busy}>
-              {busy === 'connect' && <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />}
-              {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
-            </Btn>
+          <div className="space-y-2.5">
+            <div
+              role="note"
+              aria-label={t('pages.connectionsPage.before_you_connect')}
+              className="flex items-start gap-2 rounded-md border border-warn/30 bg-warn-subtle p-2.5 text-[12px] text-text"
+            >
+              <AlertTriangle className="lucide-inline mt-0.5 shrink-0 text-warn" aria-hidden="true" />
+              <p className="m-0 leading-relaxed">
+                <span className="block font-medium text-text-strong">
+                  {t('pages.connectionsPage.before_you_connect')}
+                </span>
+                <span lang="en" className="mt-0.5 block">{provider.gotcha_copy}</span>
+              </p>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <a href={provider.docs_url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-[12px] text-muted hover:text-text">
+                {t('pages.connectionsPage.documentation')} <ExternalLink className="w-3 h-3" aria-hidden="true" />
+              </a>
+              <Btn primary onClick={() => void startMint(onConnect)} disabled={!!busy}>
+                {busy === 'connect' && <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />}
+                {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
+              </Btn>
+            </div>
           </div>
         )}
 
