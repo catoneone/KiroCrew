@@ -468,6 +468,7 @@ interface ChatInputProps {
   automationOpen?: boolean
   onAutomationChange?: (automation: AutomationRecord | null) => void
   automationCreationReady?: boolean
+  automationSnapshotFailed?: boolean
   /** Send-key mode. Default 'enter'. */
   sendOnEnter?: SendMode
   /** Follow-up options from assistant message */
@@ -802,6 +803,7 @@ function ChatInput({
   automationOpen,
   onAutomationChange,
   automationCreationReady,
+  automationSnapshotFailed,
   sendOnEnter = 'enter',
   followUpOptions,
   followUpPicked,
@@ -3512,6 +3514,7 @@ function ChatInput({
                     onOpenChange={v => onAutomationClick(v)}
                     onChange={onAutomationChange || (() => {})}
                     creationReady={automationCreationReady}
+                    snapshotFailed={automationSnapshotFailed}
                     // Same condition as the Resume placeholder (`resumeOffered`):
                     // whenever the composer says "press Resume", the loop chip
                     // must not pulse as if a cycle were executing.
