@@ -13,11 +13,19 @@ Config (JSON):
     {
       "sessions": ["dashboard_chat-601-1788099254", ...],   # slot keys to watch
       "idle_alert_secs": 900,      # silent longer than this -> IDLE alert
-      "tail_bytes": 200000,        # per-session transcript read cap
+      "tail_bytes": 200000,        # per-session transcript PARSE cap
       "load_alert_per_cpu": 1.5,   # 1-min loadavg / cpu above this -> hot
       "err_res": [...],            # extra error-tail regexes (optional)
-      "banned_process_res": [...]  # cmdline regexes for banned ops (optional)
+      "banned_process_res": [...], # cmdline regexes for banned ops (optional)
+      "init_timeout_res": [...],   # initialize-timeout tails (optional)
+      "watchdog_res": [...],       # turn-ended-by-stall-watchdog tails (optional)
+      "fleet_worktrees": [...]     # absolute roots this fleet owns (optional)
     }
+
+Every regex key is validated at load time: a bad pattern is malformed config
+(exit 2 with the offending pattern), never a crash mid-cycle. ``tail_bytes``
+caps how much of a transcript is PARSED, not how much is read -- the whole file
+is read either way, which is what makes the tail index monotonic for free.
 
 Paths are DERIVED, never configurable -- the same containment rule for every
 location this script touches, because its config is authored by a no-write
@@ -41,18 +49,45 @@ The data home is ``$KIROCREW_HOME`` when set, else ``~/.kiro/crew`` — the same
 resolution every pipeline script uses.
 
 Output (text, one line per FIRING signal; suppressed sessions print nothing):
-    🔔 <session-key> <age>s <TAG> d=<digest>
+    🔔 <session-key> <age>s <TAG> i=<index> d=<digest>
+
+``i=`` is the index of the last LINE in that session's transcript -- a monotonic
+per-session position. An unchanged index across two probes is *no progress*,
+whether or not a turn is open, and that is the discriminator a self-deadlocked
+worker cannot fake. It is a position, so it carries no transcript content.
 
 Metadata only, by design: transcript-derived text never appears in the output,
 so no private session content crosses into the caller's context whatever keys
 the config watches. Content, when a ruling needs it, is read through the
 workspace-authorized session tools.
-    BANNED pid=<pid> <cmdline>
-    OK <n> watched, <m> fired | load/cpu <x> (<posture>) | mem <G>G | banned <k>
+    BANNED pid=<pid> rule=<regex> cwd=fleet|unknown
+    OK <n> watched, <m> fired | load/cpu <x> (<posture>) | mem <G>G
+       | banned <k> | foreign <k> | deliver init-timeout <a>, watchdog <b>
+
+``banned`` counts fleet-owned matches only -- a banned command shape running in
+an unrelated checkout on the same host is somebody else's business, and counting
+it made the conductor stop a worker that was not the offender. Those are
+summarised as ``foreign`` and not printed. ``deliver`` is the honest admission
+instrument: load and memory can both read healthy while the fleet cannot
+deliver, so sessions whose tail carries an initialize timeout or a
+stall-watchdog turn end are counted every cycle, fired or not.
 
 Tags: the worker protocol words (``WORKING/PR/GREEN/BLOCKED/STANDDOWN/
-PROPOSAL``), ``ERR`` for an error/throttle tail, ``IDLE`` for silence past the
-threshold, ``-`` when a tail carries no tag (never fires on its own).
+PROPOSAL``) -- recognised in their protocol form, ``<WORD>:``, so prose that
+merely opens with one is not a report -- plus ``ERR`` for an error/throttle
+tail, ``IDLE`` for silence past the threshold, ``TERMINAL`` for a session whose
+last dispositioned report ENDED its assignment (``STANDDOWN``/``PROPOSAL``) and
+which has since written unprefixed text, and ``-`` when a tail carries no tag
+(never fires on its own). Tool rows never classify: a protocol word or an error
+phrase inside a tool card is quoted text, not a report.
+
+The tag is the newest REPORT, not the newest message, because ``BLOCKED`` is
+STICKY: a probe samples rather than subscribes, and the protocol requires a
+blocked worker to keep reporting status, so its own next message would displace
+the only thing a newest-message classifier reads. A heartbeat (``WORKING``) and
+unprefixed text leave a sticky report standing; any other report supersedes it.
+``TERMINAL`` and sticky ``BLOCKED`` are kept distinct on purpose -- one says
+close me, the other says a ruling is owed.
 
 THE HANDLED SET replaces the overnight run's hand-grown ``grep -vE`` exclusion
 pipe. Every fired line carries a ``d=<digest>`` field; ``--mark-handled KEY TAG
@@ -63,6 +98,12 @@ then suppressed while (tag, digest) both still match. A new payload under the
 same tag re-fires (a second GREEN with a new PR number is a new signal).
 ``IDLE`` marks expire after another ``idle_alert_secs``
 so a nudged-but-still-silent worker re-alerts instead of vanishing.
+
+A handled entry also records the tail ``index`` at the moment of the mark, and
+the last dispositioned PROTOCOL tag under ``proto`` -- kept in its own field so a
+later ``IDLE`` or ``GONE`` disposition cannot erase the fact that the worker
+already filed a terminal report. Neither field takes part in the digest, so a
+state file written before they existed still suppresses exactly as it did.
 
 Deliberately boring properties, do not weaken:
   * No subprocess, ever. Reads transcripts, ``/proc`` and ``loadavg`` directly.
@@ -85,7 +126,24 @@ import time
 from pathlib import Path
 from typing import Any
 
-PROTO = re.compile(r"^(GREEN|PR|BLOCKED|STANDDOWN|PROPOSAL|WORKING)\b")
+#: A worker report is ``<WORD>:`` — the colon IS the protocol, not decoration.
+#: Matching a bare word boundary instead reads ordinary prose as a report:
+#: measured over the 60 most recent transcripts on this host, 20 of the 94
+#: assistant rows that matched ``^<WORD>\b`` were not reports at all (13 of them
+#: opened with a bare ``PR #<n>``), so one row in five carried a fabricated tag.
+PROTO = re.compile(r"^(GREEN|PR|BLOCKED|STANDDOWN|PROPOSAL|WORKING)\s*:")
+
+#: Roles whose rows are TOOL ACTIVITY, never a worker's own protocol message.
+#: This is the transcript's OWN discriminator -- the writers tag a tool card with
+#: its role (``history_consolidation._TOOL_ROLES`` is the same set) and the
+#: presentation class is not persisted at all, so ``role`` is the only field that
+#: separates the two. A tool row's content is a glyph plus the tool title, so a
+#: protocol word inside one is quoted text: 87 of 2,590 measured tool rows carry
+#: one. Excluding them costs no error signal either -- across those same
+#: transcripts every ``initialize timed out`` / stall-watchdog / throttle line
+#: landed on an ``error``, ``assistant``, ``inject``, ``user`` or ``nudge`` row
+#: and not one landed on a tool row.
+TOOL_ROLES = frozenset({"tool", "tool_call", "tool_result"})
 
 #: Error shapes observed in real worker tails during the 2026-08-30 fleet run.
 DEFAULT_ERR_RES = (
@@ -94,18 +152,89 @@ DEFAULT_ERR_RES = (
     r"initialize timed out",
 )
 
-#: Banned-operation cmdline shapes: a pytest without an explicit bounded worker
-#: count (the repo's ``-n auto`` addopts means a bare pytest forks one worker
-#: per core; ``-n 4``, ``-n=4``, ``-n4`` and ``--numprocesses=4`` all count as
-#: bounded, ``-n auto`` does not), and a bare full-suite vitest with no file
-#: arguments.
+#: Banned-operation cmdline shapes: a pytest whose worker count nobody CHOSE,
+#: and a bare full-suite vitest with no file arguments.
+#:
+#: "Nobody chose" is the honest statement of what this rule catches, and it is
+#: not the same as "too many". This comment used to say a bare pytest forks one
+#: worker per core because of the repo's ``-n auto`` addopts. That premise is
+#: wrong: ``setup.cfg`` documents that ``auto`` is bounded by the rootdir
+#: conftest's ``pytest_xdist_auto_num_workers`` hook, which sizes the pool by
+#: available memory and by what concurrent runs on the host already hold, and
+#: that "an explicit ``-n <N>`` bypasses the budget". So on THIS repo the
+#: explicit spelling is the one that can outgrow the host, and ``auto`` is the
+#: one that cannot.
+#:
+#: The rule's sense is deliberately left as it stands, because changing which
+#: shapes it flags changes what the conductor stops mid-turn across a whole
+#: fleet, and that is not a comment's decision to make. What it costs is stated
+#: plainly instead: ``-n 4``, ``-n=4``, ``-n4``, ``-n0`` and
+#: ``--numprocesses=4`` all read as bounded, ``-n auto`` and a bare pytest do
+#: not. ``-n0`` is the repo's own documented override and is genuinely
+#: in-process, so the safest form a worker can run is also a passing one.
 DEFAULT_BANNED_RES = (
     r"\bpytest\b(?!.*(?:-n|--numprocesses)\s*=?\s*\d)",
     r"\bvitest\b\s+run\s*$",
 )
 
+#: An initialize-timeout tail: the session never got a live backend, so nothing
+#: it was told to do was ever delivered. Literal from the emitters
+#: (``mcp_gateway.backend`` records ``initialize timed out on respawn``).
+DEFAULT_INIT_TIMEOUT_RES = (r"initialize timed out",)
+
+#: A turn ended by the stall watchdog rather than by the worker. Literals from
+#: the emitters: ``dashboard.state.TOOL_STALL_RECOVERY_PREFIX`` /
+#: ``STALE_RECOVERY_PREFIX`` (the recovery notice injected into the transcript)
+#: and ``acp.types.STOP_REASON_TOOL_STALL``. The dash inside the bracketed
+#: notices is matched as ``.*`` so an em-dash/hyphen change in the emitter does
+#: not silently stop counting.
+DEFAULT_WATCHDOG_RES = (
+    r"\[Tool stall\b.*automatic recovery\]",
+    r"\[Stalled turn\b.*automatic recovery\]",
+    r"error: tool stall",
+    r"tool stalled\b.*no data for",
+)
+
 IDLE_TAG = "IDLE"
-_FIRING = {"GREEN", "PR", "BLOCKED", "STANDDOWN", "PROPOSAL", "ERR", IDLE_TAG}
+TERMINAL_TAG = "TERMINAL"
+
+#: The protocol words a worker may open a report with. Kept as a set beside
+#: ``PROTO`` because the handled set records the last DISPOSITIONED protocol tag
+#: and has to recognise one without re-matching prose.
+PROTO_TAGS = frozenset({"GREEN", "PR", "BLOCKED", "STANDDOWN", "PROPOSAL", "WORKING"})
+
+#: Reports that END an assignment. A worker that files one and then writes an
+#: unprefixed line is finished, not wedged, and must not age into IDLE.
+TERMINAL_TAGS = frozenset({"STANDDOWN", "PROPOSAL"})
+
+#: Reports that keep their meaning until the conductor ACTS on them.
+#:
+#: A probe samples; it does not subscribe. So it can only ever see a session's
+#: newest message, and a state that was overwritten between two samples is not
+#: suppressed or deferred -- it is never observed at all. ``BLOCKED`` is exactly
+#: the state that gets overwritten, because the protocol requires a blocked
+#: worker to keep reporting status, so its own next message displaces the only
+#: place a sampling probe looks. The debt then exists on both sides and is
+#: visible to neither: the worker holds position waiting for a ruling, and the
+#: conductor never learned it owes one.
+#:
+#: Sticky is what survives the sample. A sticky report is not cleared by a
+#: heartbeat or by unprefixed text; only another real report clears it, and the
+#: conductor's own act of delivering the ruling (``--mark-handled``) is what
+#: quiets it.
+#:
+#: Deliberately NOT merged with ``TERMINAL_TAGS``: ``TERMINAL`` means close me,
+#: sticky ``BLOCKED`` means a ruling is owed. Those call for opposite actions, so
+#: collapsing them would trade one invisible obligation for a wrong one.
+STICKY_TAGS = frozenset({"BLOCKED"})
+
+#: A heartbeat reports that the worker is ALIVE, not what state it is in, so it
+#: cannot clear a sticky report. Every other protocol word can: a worker that
+#: files ``PR``, ``GREEN``, ``STANDDOWN`` or ``PROPOSAL`` after being blocked has
+#: moved on, and no ruling is owed any more.
+HEARTBEAT_TAGS = frozenset({"WORKING"})
+
+_FIRING = {"GREEN", "PR", "BLOCKED", "STANDDOWN", "PROPOSAL", "ERR", IDLE_TAG, TERMINAL_TAG}
 
 #: A session key is a filename STEM, never a path: one path-safe token. This is
 #: what keeps an agent-authored key (``../../etc/foo``, an absolute path) from
@@ -141,40 +270,156 @@ def _text_of(entry: dict[str, Any]) -> str:
     return str(entry.get("text", ""))
 
 
-def _tail_entries(path: Path, max_bytes: int) -> list[dict[str, Any]]:
+def _tail_entries(path: Path, max_bytes: int) -> tuple[list[dict[str, Any]], int | None]:
+    """Parse the tail window, and report the index of the LAST line in the file.
+
+    The index is 2a's no-progress discriminator: unchanged across two probes
+    means the session has not spoken, whether or not a turn is open, and that is
+    the one thing a self-deadlocked worker cannot fake. It is therefore counted
+    from the START of the file, not from the start of the window. A
+    window-relative count would saturate the moment a transcript passes
+    ``tail_bytes`` (200 KB by default) and then stay frozen while the session
+    talked -- reading, at exactly the sizes real worker sessions reach, as the
+    deadlock it exists to detect.
+
+    Counting from the start is free: this read already loads the whole file and
+    throws away everything but the window, so the prefix is in hand. Lines are
+    counted rather than parsed entries, so the index does not move when a
+    truncated window edge fails to parse -- it is a position, not a tally of
+    well-formed rows.
+
+    Returns ``(entries, last_index)``; ``last_index`` is None for an unreadable
+    or empty file, which prints as ``i=?`` exactly like an unknown age.
+    """
     try:
-        raw = path.read_bytes()[-max_bytes:]
+        raw = path.read_bytes()
     except OSError:
-        return []
+        return [], None
+    if len(raw) > max_bytes:
+        cut = len(raw) - max_bytes
+        # Newlines strictly before the window: the line straddling the cut is
+        # NOT counted here, and appears (truncated) as the window's first line,
+        # so it is counted exactly once.
+        skipped = raw.count(b"\n", 0, cut)
+        window = raw[cut:]
+    else:
+        skipped = 0
+        window = raw
+    lines = window.splitlines()
     entries: list[dict[str, Any]] = []
-    for line in raw.splitlines():
+    for line in lines:
         try:
             parsed = json.loads(line)
         except Exception:
             continue  # a truncated first line is expected when tailing
         if isinstance(parsed, dict):
             entries.append(parsed)
-    return entries
+    last_index = skipped + len(lines) - 1 if lines else None
+    return entries, last_index
 
 
 def _classify(entries: list[dict[str, Any]], err_res: list[re.Pattern[str]]) -> tuple[str, str]:
-    """Return (tag, tail_text) for one session's transcript tail."""
-    last_assistant = next(
-        (
-            _text_of(entry).strip()
-            for entry in reversed(entries)
-            if entry.get("role") == "assistant" and _text_of(entry).strip()
-        ),
-        "",
-    )
-    last_any = entries[-1] if entries else {}
+    """Return (tag, tail_text) for one session's transcript tail.
+
+    Classification reads only what the session SAID -- tool rows are dropped
+    first, so neither half can be driven by tool text. The tag half already
+    looked at ``role == "assistant"`` alone, but the error half read the last
+    entry of ANY role, and a tool row is the last row on roughly one transcript
+    in ten (6 of 60 measured), so an error pattern quoted in a tool title used
+    to raise ERR on a healthy worker.
+
+    The tag is the newest REPORT rather than the newest message, and a sticky
+    report outlives the messages that follow it. Reading only the newest message
+    makes a sampling probe structurally unable to see a state its own protocol
+    guarantees will be overwritten -- see ``STICKY_TAGS``. The returned tail is
+    the sticky report's OWN text, which is what keeps its digest stable while the
+    worker goes on filing heartbeats: the signal fires once, is suppressed by the
+    ruling, and re-fires only if the worker files a genuinely new one.
+
+    ERR still takes precedence, because an errored session must be resumed before
+    anything it said can be acted on. That defers a sticky report by one cycle at
+    most: the ERR is marked, the tail is unchanged, and the sticky report is what
+    the next probe classifies.
+    """
+    spoken = [entry for entry in entries if str(entry.get("role", "")) not in TOOL_ROLES]
+    last_assistant = ""
+    newest_report: tuple[str, str] | None = None
+    sticky_report: tuple[str, str] | None = None
+    for entry in reversed(spoken):
+        if entry.get("role") != "assistant":
+            continue
+        text = _text_of(entry).strip()
+        if not text:
+            continue
+        if not last_assistant:
+            last_assistant = text
+        match = PROTO.match(text)
+        if match is None:
+            continue
+        tag = match.group(1)
+        if newest_report is None:
+            newest_report = (tag, text)
+        if tag not in HEARTBEAT_TAGS:
+            # The newest report that actually states a state. Walking stops here:
+            # anything older has already been superseded by this one.
+            sticky_report = (tag, text)
+            break
+
+    last_any = spoken[-1] if spoken else {}
     last_any_text = _text_of(last_any)
     if "error" in str(last_any.get("role", "")).lower() or any(
         rx.search(last_any_text) for rx in err_res
     ):
         return "ERR", (last_any_text.strip() or last_assistant)
-    match = PROTO.match(last_assistant)
-    return (match.group(1) if match else "-"), last_assistant
+
+    if sticky_report is not None and sticky_report[0] in STICKY_TAGS:
+        return sticky_report
+    if newest_report is not None:
+        return newest_report
+    return "-", last_assistant
+
+
+def _tail_matches(entries: list[dict[str, Any]], patterns: list[re.Pattern[str]]) -> bool:
+    """Does anything the session SAID in this window match one of *patterns*?
+
+    Used for the delivery counters (2c), which are per-session facts, not
+    per-tag ones: a session can be counted as undelivered while its tag is
+    something else entirely, which is the whole point -- load and memory read
+    healthy while the fleet cannot deliver.
+
+    Tool rows are skipped for the same reason ``_classify`` skips them, and the
+    measurement backs it: over the 60 most recent transcripts on the development
+    host, every initialize-timeout and stall-watchdog line landed on an
+    ``error``, ``assistant``, ``inject``, ``user`` or ``nudge`` row and not one
+    landed on a tool row. The whole window is scanned, not just the last row --
+    a watchdog notice is followed by whatever the session did next, so reading
+    only the final row would miss nearly all of them.
+    """
+    for entry in entries:
+        if str(entry.get("role", "")) in TOOL_ROLES:
+            continue
+        text = _text_of(entry)
+        if text and any(rx.search(text) for rx in patterns):
+            return True
+    return False
+
+
+def _recorded_proto(handled: dict[str, Any], key: str) -> str | None:
+    """The last DISPOSITIONED protocol tag for *key*, or None.
+
+    Stored under its own field so a later non-protocol disposition (an ``IDLE``
+    nudge, a ``GONE`` reclaim) cannot erase it. Without that, a finished worker
+    read identically to a wedged one: the handled set keeps one entry per key,
+    so the terminal report was overwritten by the very next tag.
+
+    Absent on a state file written before this field existed, which reads as
+    "no terminal disposition recorded" -- the pre-2b behaviour, not a crash.
+    """
+    entry = handled.get(key)
+    if not isinstance(entry, dict):
+        return None
+    recorded = entry.get("proto")
+    return recorded if isinstance(recorded, str) else None
 
 
 def _digest(text: str) -> str:
@@ -201,16 +446,85 @@ def _suppressed(handled: dict[str, Any], key: str, tag: str, digest: str, idle_s
     return True
 
 
+def _norm_path(path: str) -> str:
+    """A compare-ready spelling of *path*.
+
+    Two spellings of one directory must not read as two directories, or a
+    fleet-owned process is filed as somebody else's and its banned run goes
+    unreported. Three normalisations, all of them load-bearing on Windows, where
+    this ran green on Linux and misfiled every match:
+
+    * the extended-length prefix. ``os.readlink`` can answer ``\\\\?\\D:\\...``,
+      which no configured root will ever spell, so a literal prefix comparison
+      fails on a path that does match.
+    * case and separator. ``normcase`` folds both, since ``D:/a`` and ``d:\\a``
+      are the same directory there and only one of them is what the config says.
+    * short (8.3) names. Left to ``os.path.realpath`` in the caller's fallback,
+      because expanding them requires touching the filesystem and this half must
+      stay a pure string operation for the unreadable-cwd case.
+    """
+    if path.startswith("\\\\?\\"):
+        path = path[4:]
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _under(child: str, root: str) -> bool:
+    """Is *child* the directory *root* or inside it?
+
+    The boundary test is a separator, not a bare prefix: without it a sibling
+    worktree named ``wt-a-old`` is swallowed by ``wt-a`` and its runs are
+    attributed to the wrong owner.
+    """
+    return child == root or child.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _cwd_class(proc_entry: Path, fleet: list[str]) -> str:
+    """``fleet``, ``foreign`` or ``unknown`` for the process at *proc_entry*.
+
+    ``/proc/<pid>/cwd`` is a symlink to the working directory, so the link TARGET
+    is the answer and an unreadable link (a process that exited between the scan
+    and the read, or one owned by another user) is ``unknown`` -- never silently
+    ``foreign``, because dropping an unreadable match is how a real banned run
+    inside the fleet would go unreported.
+
+    An empty or unset ``fleet_worktrees`` declares no scope, and scoping against
+    an empty set would classify every match as ``foreign`` and mute the banned
+    signal entirely -- a failure the conductor cannot see. Unscoped therefore
+    means ``unknown``: every match is still reported and still counted, which is
+    exactly the pre-2d behaviour.
+
+    The comparison gets a second chance through ``realpath`` because a match
+    missed is a banned run inside the fleet reported as somebody else's: it
+    absorbs a symlinked worktree root and a Windows short (8.3) name, either of
+    which spells the same directory a way the literal form does not.
+    """
+    try:
+        target = os.readlink(proc_entry / "cwd")
+    except OSError:
+        return "unknown"
+    if not fleet:
+        return "unknown"
+    literal = _norm_path(target)
+    if any(_under(literal, _norm_path(root)) for root in fleet):
+        return "fleet"
+    real = _norm_path(os.path.realpath(target))
+    if any(_under(real, _norm_path(os.path.realpath(root))) for root in fleet):
+        return "fleet"
+    return "foreign"
+
+
 def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
     """Banned-process lines plus the host summary fragment."""
     banned_res = [
         re.compile(rx) for rx in cfg.get("banned_process_res") or list(DEFAULT_BANNED_RES)
     ]
+    fleet = [p for p in cfg.get("fleet_worktrees") or []]
     lines: list[str] = []
     # /proc, with an env seam for the test harness only -- not a config key,
     # for the same containment reason as the other paths.
     proc_root = Path(os.environ.get("KIROCREW_PROBE_PROC_ROOT") or "/proc")
     banned = 0
+    foreign = 0
     if proc_root.is_dir():
         for entry in proc_root.iterdir():
             if not entry.name.isdigit():
@@ -227,14 +541,25 @@ def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
                 continue
             if cmd:
                 matched = next((rx.pattern for rx in banned_res if rx.search(cmd)), None)
-                if matched is not None:
-                    banned += 1
-                    # pid + WHICH RULE fired is everything the conductor needs
-                    # (stop the owner, re-seed with the directive). The argv is
-                    # deliberately not echoed: a command line can carry
-                    # credentials or presigned URLs, and this line lands in the
-                    # conductor's model context.
-                    lines.append(f"BANNED pid={entry.name} rule={matched}")
+                if matched is None:
+                    continue
+                # A banned SHAPE is only a banned OPERATION when the fleet owns
+                # it. The same unbounded pytest run in an unrelated checkout is
+                # this machine's business, and counting it made the conductor
+                # stop a worker that was not the offender -- so the cwd decides
+                # which counter it lands in, and only fleet-owned or unreadable
+                # matches are printed at all.
+                cwd_class = _cwd_class(entry, fleet)
+                if cwd_class == "foreign":
+                    foreign += 1
+                    continue
+                banned += 1
+                # pid + WHICH RULE fired + the cwd class is everything the
+                # conductor needs (stop the owner, re-seed with the directive).
+                # The argv is deliberately not echoed: a command line can carry
+                # credentials or presigned URLs, and this line lands in the
+                # conductor's model context.
+                lines.append(f"BANNED pid={entry.name} rule={matched} cwd={cwd_class}")
     per_cpu = None
     if hasattr(os, "getloadavg"):
         try:
@@ -257,7 +582,7 @@ def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
         else "load/cpu n/a"
     )
     mem_part = f"mem {mem_gb:.0f}G" if mem_gb is not None else "mem n/a"
-    return lines, f"{load_part} | {mem_part} | banned {banned}"
+    return lines, f"{load_part} | {mem_part} | banned {banned} | foreign {foreign}"
 
 
 def _sessions_dir() -> Path:
@@ -304,9 +629,15 @@ def run_probe(cfg: dict[str, Any], state_path: Path) -> int:
     idle_secs = int(cfg.get("idle_alert_secs", 900))
     tail_bytes = int(cfg.get("tail_bytes", 200_000))
     err_res = [re.compile(rx) for rx in (list(DEFAULT_ERR_RES) + list(cfg.get("err_res") or []))]
+    init_res = [
+        re.compile(rx) for rx in cfg.get("init_timeout_res") or list(DEFAULT_INIT_TIMEOUT_RES)
+    ]
+    watchdog_res = [re.compile(rx) for rx in cfg.get("watchdog_res") or list(DEFAULT_WATCHDOG_RES)]
     handled = _handled_of(_load_state(state_path))
 
     fired = 0
+    init_timeouts = 0
+    watchdogs = 0
     for key in sessions:
         path = _transcript_path(sessions_dir, key)
         age: int | None = None
@@ -319,11 +650,32 @@ def run_probe(cfg: dict[str, Any], state_path: Path) -> int:
             # GONE flows through the same suppression as every other tag: an
             # acted-on GONE (item reclaimed, mark-handled) must not re-fire
             # every cycle until the key is dropped from the watch list.
-            tag, tail, age_text = "GONE", "transcript missing", "?"
+            tag, tail, age_text, index = "GONE", "transcript missing", "?", None
         else:
-            tag, tail = _classify(_tail_entries(path, tail_bytes), err_res)
-            if tag not in _FIRING and age > idle_secs:
-                tag = IDLE_TAG
+            entries, index = _tail_entries(path, tail_bytes)
+            tag, tail = _classify(entries, err_res)
+            # Counted for every watched session, fired or not: an undelivered
+            # session is a fleet fact, not a per-tag one.
+            init_timeouts += 1 if _tail_matches(entries, init_res) else 0
+            watchdogs += 1 if _tail_matches(entries, watchdog_res) else 0
+            if tag not in _FIRING:
+                # A worker that filed a terminal report and then wrote one
+                # unprefixed line is FINISHED. Ageing it into IDLE says the
+                # opposite, and the two readings call for opposite actions
+                # (close the item vs. nudge or reclaim it), so TERMINAL takes
+                # precedence over the clock.
+                #
+                # ``tag == "-"`` is load-bearing: the non-firing set holds BOTH
+                # ``-`` and ``WORKING``, so without it a worker that stood down,
+                # was re-seeded, and is now reporting ``WORKING:`` would read as
+                # finished and have its live work closed. WORKING is a protocol
+                # message and means active work; only an unprefixed tail can
+                # inherit a terminal disposition. A WORKING tail that then goes
+                # silent still ages into IDLE, which is the correct nudge.
+                if tag == "-" and _recorded_proto(handled, key) in TERMINAL_TAGS:
+                    tag = TERMINAL_TAG
+                elif age > idle_secs:
+                    tag = IDLE_TAG
             if tag not in _FIRING:
                 continue
             age_text = str(age)
@@ -331,18 +683,23 @@ def run_probe(cfg: dict[str, Any], state_path: Path) -> int:
         if _suppressed(handled, key, tag, digest, idle_secs):
             continue
         fired += 1
-        # Metadata ONLY: key, age, tag, digest. Transcript-derived text is
+        # Metadata ONLY: key, age, tag, index, digest. Transcript-derived text is
         # deliberately never printed -- the conductor's action table is
         # tag-keyed, and content, when a ruling needs it, is read through the
         # workspace-authorized session tools, not through this script. That
         # keeps the probe's output free of private session text no matter
-        # which keys an (agent-authored) config watches.
-        print(f"🔔 {key:<28} {age_text:>5}s {tag:<9} d={digest}")
+        # which keys an (agent-authored) config watches. The index is a line
+        # POSITION, so it carries no content either.
+        index_text = "?" if index is None else str(index)
+        print(f"🔔 {key:<28} {age_text:>5}s {tag:<9} i={index_text} d={digest}")
 
     banned_lines, host = _host_lines(cfg)
     for line in banned_lines:
         print(line)
-    print(f"OK {len(sessions)} watched, {fired} fired | {host}")
+    print(
+        f"OK {len(sessions)} watched, {fired} fired | {host} | "
+        f"deliver init-timeout {init_timeouts}, watchdog {watchdogs}"
+    )
     return 0
 
 
@@ -353,8 +710,10 @@ def mark_handled(cfg: dict[str, Any], state_path: Path, key: str, tag: str, dige
     tail_bytes = int(cfg.get("tail_bytes", 200_000))
     err_res = [re.compile(rx) for rx in (list(DEFAULT_ERR_RES) + list(cfg.get("err_res") or []))]
     path = _transcript_path(_sessions_dir(), key)
+    index: int | None = None
     if path is not None and path.exists():
-        current_tag, tail = _classify(_tail_entries(path, tail_bytes), err_res)
+        entries, index = _tail_entries(path, tail_bytes)
+        current_tag, tail = _classify(entries, err_res)
         del current_tag  # the digest is keyed on the CALLER's tag, like the probe's
     else:
         tail = "transcript missing"  # mirror run_probe's GONE payload exactly
@@ -372,11 +731,22 @@ def mark_handled(cfg: dict[str, Any], state_path: Path, key: str, tag: str, dige
     state = _load_state(state_path)
     handled = _handled_of(state)
     state["handled"] = handled
-    handled[key] = {
+    entry: dict[str, Any] = {
         "tag": tag,
         "digest": current,
         "ts": int(time.time()),
     }
+    if index is not None:
+        entry["index"] = index
+    # The last dispositioned PROTOCOL tag survives a later non-protocol
+    # disposition, because "this worker filed a terminal report" and "this
+    # worker went quiet" are different facts and the second must not erase the
+    # first. Carried forward from the previous entry when this mark is not
+    # itself a protocol tag.
+    proto = tag if tag in PROTO_TAGS else _recorded_proto(handled, key)
+    if proto is not None:
+        entry["proto"] = proto
+    handled[key] = entry
     state["updated_at"] = int(time.time())
     _atomic_write(state_path, json.dumps(state, indent=1, sort_keys=True) + "\n")
     print(f"handled {key} {tag}")
@@ -386,7 +756,14 @@ def mark_handled(cfg: dict[str, Any], state_path: Path, key: str, tag: str, dige
 def _config_error(cfg: dict[str, Any]) -> str | None:
     """The first problem with a parsed config, or None. Typed misconfiguration
     is malformed config (exit 2 with a message), never an uncaught crash."""
-    for key in ("sessions", "err_res", "banned_process_res"):
+    for key in (
+        "sessions",
+        "err_res",
+        "banned_process_res",
+        "init_timeout_res",
+        "watchdog_res",
+        "fleet_worktrees",
+    ):
         value = cfg.get(key)
         if value is not None and (
             not isinstance(value, list) or any(not isinstance(item, str) for item in value)
@@ -395,6 +772,13 @@ def _config_error(cfg: dict[str, Any]) -> str | None:
     for item in cfg.get("sessions") or []:
         if not _KEY_RE.fullmatch(item):
             return f"session key {item!r} is not a plain key (keys are stems, never paths)"
+    # A relative worktree root would be compared against an absolute
+    # /proc/<pid>/cwd target and could never match, so every banned run inside
+    # the fleet would be filed as foreign and go unreported. Say so at load time
+    # rather than silently muting the signal.
+    for item in cfg.get("fleet_worktrees") or []:
+        if not os.path.isabs(item):
+            return f"fleet_worktrees entry {item!r} must be an absolute path"
     for key in ("idle_alert_secs", "tail_bytes", "load_alert_per_cpu"):
         value = cfg.get(key)
         if value is None:
@@ -409,7 +793,12 @@ def _config_error(cfg: dict[str, Any]) -> str | None:
             or value < 0
         ):
             return f"{key} must be a finite non-negative number"
-    for rx in list(cfg.get("err_res") or []) + list(cfg.get("banned_process_res") or []):
+    for rx in (
+        list(cfg.get("err_res") or [])
+        + list(cfg.get("banned_process_res") or [])
+        + list(cfg.get("init_timeout_res") or [])
+        + list(cfg.get("watchdog_res") or [])
+    ):
         try:
             re.compile(rx)
         except re.error as exc:

@@ -191,6 +191,18 @@ class TestFleetProbe:
             stamp = time.time() - age_secs
             os.utime(path, (stamp, stamp))
 
+    def _transcript(
+        self, sessions_dir: Path, key: str, rows: list[dict], *, age_secs: int = 0
+    ) -> None:
+        """``_session`` for a tail whose ROLES matter -- a tool card, an error
+        row, a nudge -- rather than one assistant line. The rows are written as
+        given so a test can pin the shape the real writers produce."""
+        path = sessions_dir / f"{key}.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        if age_secs:
+            stamp = time.time() - age_secs
+            os.utime(path, (stamp, stamp))
+
     def _config(self, tmp_path: Path, monkeypatch, sessions: list[str], **extra) -> Path:
         """Config file + the env the script derives its paths from: transcripts
         under $KIROCREW_HOME/sessions, /proc behind the test-only env seam --
@@ -216,6 +228,20 @@ class TestFleetProbe:
         assert match is not None, line
         return match.group(1)
 
+    @staticmethod
+    def _index_of(out: str, key: str) -> int:
+        """The i= field of KEY's fired line -- the tail position."""
+        line = next(ln for ln in out.splitlines() if key in ln and "i=" in ln)
+        match = re.search(r"i=(\d+)", line)
+        assert match is not None, line
+        return int(match.group(1))
+
+    @staticmethod
+    def _handled(cfg_path: Path) -> dict:
+        """The handled map out of the DERIVED state file beside the config."""
+        state = json.loads(Path(f"{cfg_path}.state.json").read_text(encoding="utf-8"))
+        return state["handled"]
+
     def test_protocol_tag_fires_and_working_stays_quiet(self, tmp_path, capsys, monkeypatch):
         mod = self._mod()
         cfg = self._config(tmp_path, monkeypatch, ["s-green", "s-working"])
@@ -225,6 +251,76 @@ class TestFleetProbe:
         assert "s-green" in out and "GREEN" in out
         assert "s-working" not in out  # WORKING is a heartbeat, not a signal
         assert "OK 2 watched, 1 fired" in out
+
+    def test_a_protocol_word_in_prose_is_not_a_report(self, tmp_path, capsys, monkeypatch):
+        """The protocol is ``<WORD>:``. A line that merely OPENS with a protocol
+        word -- ``PR #6580 is green ...`` -- is prose, and tagging it invents a
+        report nobody filed. Measured over the 60 most recent transcripts on the
+        development host, 20 of the 94 assistant rows that matched the old
+        ``^<WORD>\\b`` form were prose, 13 of them a bare ``PR #<n>``."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-prose"])
+        self._session(
+            tmp_path / "sessions", "s-prose", "PR #6580 is green, waiting on a human review"
+        )
+        out = self._run(mod, cfg, capsys)
+        assert "s-prose" not in out, "prose opening with a protocol word must not fire"
+        assert "OK 1 watched, 0 fired" in out
+
+    def test_a_tool_line_carrying_protocol_words_never_classifies(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Contract 2e: a tool-call row is not a protocol message.
+
+        ``role`` is the transcript's own discriminator -- the presentation class
+        is not persisted, so nothing else separates a tool card from a spoken
+        line. The tag half already read assistant rows alone; the ERROR half read
+        the last row of ANY role, and a tool row is last on roughly one
+        transcript in ten, so an error phrase quoted inside a tool title raised
+        ERR on a healthy worker. Here the tool line carries ``STANDDOWN``,
+        ``PR:`` AND an error phrase: none of the three may classify."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-tool"])
+        self._transcript(
+            tmp_path / "sessions",
+            "s-tool",
+            [
+                {"role": "user", "content": "seed"},
+                {"role": "assistant", "content": "reading the diff"},
+                {
+                    "role": "tool",
+                    "content": (
+                        "🔧 monitor_start message=STANDDOWN: done — PR: https://x "
+                        "(retry after dispatch failure)"
+                    ),
+                },
+            ],
+        )
+        out = self._run(mod, cfg, capsys)
+        assert "s-tool" not in out, "tool text must not classify"
+        for tag in ("STANDDOWN", "PR ", "ERR"):
+            assert tag not in out
+        assert "OK 1 watched, 0 fired" in out
+
+    def test_a_spoken_report_still_fires_with_a_tool_row_after_it(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The other half of 2e: dropping tool rows must not drop the REPORT.
+        A worker that files ``GREEN:`` and then calls one more tool is still
+        green, and tool rows outnumber spoken ones about two to one."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-green-then-tool"])
+        self._transcript(
+            tmp_path / "sessions",
+            "s-green-then-tool",
+            [
+                {"role": "user", "content": "seed"},
+                {"role": "assistant", "content": "GREEN: https://x/pull/1 abc123 all lanes clean"},
+                {"role": "tool", "content": "🔧 autonudge_stop"},
+            ],
+        )
+        out = self._run(mod, cfg, capsys)
+        assert "s-green-then-tool" in out and "GREEN" in out
 
     def test_idle_alert_fires_past_threshold(self, tmp_path, capsys, monkeypatch):
         mod = self._mod()
@@ -306,9 +402,16 @@ class TestFleetProbe:
         assert "pid=4343" not in out  # bounded -n 4 run is legitimate
 
     def test_every_bounded_pytest_spelling_is_legitimate(self, tmp_path, capsys, monkeypatch):
-        """`-n 4`, `-n=4`, `-n4` and `--numprocesses=4` are all bounded runs;
-        flagging any of them would make the conductor stop a healthy worker
-        and discard its active turn."""
+        """`-n 4`, `-n=4`, `-n4`, `--numprocesses=4` and `-n0` are all bounded
+        runs; flagging any of them would make the conductor stop a healthy worker
+        and discard its active turn.
+
+        ``-n0`` earns its own case because it is the form the fleet is REQUIRED
+        to use: it is the repo's documented override (``setup.cfg``: "Override
+        with -n0 for debugging"), it is genuinely in-process, and a rule that
+        flagged the mandated form would stop every worker obeying it. It is
+        covered by the same ``\\d`` branch as ``-n4``, which is asserted here
+        rather than assumed."""
         mod = self._mod()
         proc = tmp_path / "proc"
         for pid, argv in (
@@ -316,13 +419,16 @@ class TestFleetProbe:
             ("12", b"pytest\x00-n4\x00test/x.py\x00"),
             ("13", b"pytest\x00--numprocesses=4\x00test/x.py\x00"),
             ("14", b"pytest\x00-n\x00auto\x00test/x.py\x00"),  # unbounded: fires
+            ("15", b"python\x00-m\x00pytest\x00-n0\x00test/x.py\x00-x\x00-q\x00"),
+            ("16", b"pytest\x00-n\x000\x00test/x.py\x00"),
+            ("17", b"pytest\x00--numprocesses=0\x00test/x.py\x00"),
         ):
             (proc / pid).mkdir(parents=True)
             (proc / pid / "cmdline").write_bytes(argv)
         cfg = self._config(tmp_path, monkeypatch, [])
         monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
         out = self._run(mod, cfg, capsys)
-        for quiet in ("pid=11", "pid=12", "pid=13"):
+        for quiet in ("pid=11", "pid=12", "pid=13", "pid=15", "pid=16", "pid=17"):
             assert quiet not in out, quiet
         assert "pid=14" in out  # -n auto is the unbounded case
 
@@ -448,6 +554,695 @@ class TestFleetProbe:
         self._run(mod, cfg, capsys, "--mark-handled", "s-1", "GREEN", self._digest_of(out, "s-1"))
         assert victim.read_text(encoding="utf-8") == "precious"
         assert Path(f"{cfg}.state.json").exists()
+
+    # ── 2a: the tail index ────────────────────────────────────────────────────
+
+    def test_every_fired_line_carries_the_index_before_the_digest(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Field ORDER is part of the contract: the conductor's action table
+        parses these lines positionally, so ``i=`` goes before ``d=``."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-1"])
+        self._session(tmp_path / "sessions", "s-1", "GREEN: https://x/pull/1 abc123")
+        line = next(ln for ln in self._run(mod, cfg, capsys).splitlines() if "s-1" in ln)
+        assert re.search(r"\bi=\d+\s+d=\S+", line), line
+
+    def test_an_unchanged_index_across_two_probes_is_no_progress(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The index is the no-progress discriminator: it must hold still while
+        the session is silent and move the moment it speaks. A wall-clock age
+        cannot answer this -- anything that touches the file ages it."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-1"])
+        sessions = tmp_path / "sessions"
+        self._session(sessions, "s-1", "BLOCKED: waiting on a ruling")
+        first = self._index_of(self._run(mod, cfg, capsys), "s-1")
+        # Same transcript, second probe: no progress, so the index must not move.
+        assert self._index_of(self._run(mod, cfg, capsys), "s-1") == first
+        with (sessions / "s-1.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"role": "assistant", "content": "BLOCKED: still"}) + "\n")
+        assert self._index_of(self._run(mod, cfg, capsys), "s-1") == first + 1
+
+    def test_the_index_stays_monotonic_past_the_parse_cap(self, tmp_path, capsys, monkeypatch):
+        """Counted from the START of the file, not the start of the parse window.
+
+        A window-relative count saturates once a transcript passes ``tail_bytes``
+        and then stays frozen while the session talks -- reading, at exactly the
+        sizes real worker sessions reach, as the deadlock the index exists to
+        detect. Here the transcript is deliberately far larger than the cap.
+        """
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-big"], tail_bytes=2000)
+        sessions = tmp_path / "sessions"
+        rows = [{"role": "user", "content": "x" * 200} for _ in range(60)]
+        rows.append({"role": "assistant", "content": "PROPOSAL: https://x/issues/1"})
+        self._transcript(sessions, "s-big", rows)
+        first = self._index_of(self._run(mod, cfg, capsys), "s-big")
+        assert first == len(rows) - 1, "the index must count from the file start"
+        with (sessions / "s-big.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"role": "assistant", "content": "PROPOSAL: v2"}) + "\n")
+        assert self._index_of(self._run(mod, cfg, capsys), "s-big") == first + 1
+
+    def test_mark_handled_records_the_index_and_keeps_its_signature(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """``--mark-handled KEY TAG DIGEST`` stays exactly three positional
+        arguments; the index rides along in the state entry."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-1"])
+        self._session(tmp_path / "sessions", "s-1", "GREEN: https://x/pull/1 abc123")
+        out = self._run(mod, cfg, capsys)
+        self._run(mod, cfg, capsys, "--mark-handled", "s-1", "GREEN", self._digest_of(out, "s-1"))
+        entry = self._handled(cfg)["s-1"]
+        assert entry["index"] == self._index_of(out, "s-1")
+        assert entry["tag"] == "GREEN"
+
+    # ── 2b: TERMINAL ──────────────────────────────────────────────────────────
+
+    def test_a_terminal_report_then_unprefixed_text_is_terminal_not_idle(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """A worker that filed STANDDOWN and then wrote one unprefixed line is
+        FINISHED. Ageing it into IDLE says the opposite, and the two readings
+        call for opposite actions -- close the item, or nudge and reclaim it."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-done"], idle_alert_secs=100)
+        sessions = tmp_path / "sessions"
+        self._session(sessions, "s-done", "STANDDOWN: covered by an already-merged PR")
+        out = self._run(mod, cfg, capsys)
+        assert "STANDDOWN" in out
+        self._run(
+            mod,
+            cfg,
+            capsys,
+            "--mark-handled",
+            "s-done",
+            "STANDDOWN",
+            self._digest_of(out, "s-done"),
+        )
+        # ... then one unprefixed line, and the clock runs past the idle threshold.
+        self._session(sessions, "s-done", "thanks, nothing further from me", age_secs=500)
+        out = self._run(mod, cfg, capsys)
+        assert "TERMINAL" in out
+        assert "IDLE" not in out
+
+    def test_a_resumed_worker_reporting_working_is_not_terminal(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """TERMINAL replaces IDLE only for a tail with NO protocol prefix.
+
+        ``WORKING:`` is a protocol message and it means active work. A worker
+        that stood down, was re-seeded, and is now reporting WORKING must not
+        read as finished: TERMINAL closes the item, so this inversion would
+        abandon live work. The non-firing set holds BOTH ``-`` and ``WORKING``,
+        which is how they came to share a branch."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-resumed"], idle_alert_secs=100)
+        sessions = tmp_path / "sessions"
+        self._session(sessions, "s-resumed", "STANDDOWN: nothing further")
+        out = self._run(mod, cfg, capsys)
+        self._run(
+            mod,
+            cfg,
+            capsys,
+            "--mark-handled",
+            "s-resumed",
+            "STANDDOWN",
+            self._digest_of(out, "s-resumed"),
+        )
+        # Re-seeded: the worker is working again and says so.
+        self._session(sessions, "s-resumed", "WORKING: re-seeded, reproducing")
+        out = self._run(mod, cfg, capsys)
+        assert "TERMINAL" not in out, "an active WORKING report must not read as finished"
+        assert "s-resumed" not in out  # WORKING is a heartbeat, not a signal
+        # And the clock still governs a WORKING tail that then goes silent.
+        self._session(sessions, "s-resumed", "WORKING: still reproducing", age_secs=500)
+        out = self._run(mod, cfg, capsys)
+        assert "IDLE" in out and "TERMINAL" not in out
+
+    # ── 2b extension: sticky BLOCKED ──────────────────────────────────────────
+
+    def test_blocked_survives_the_heartbeats_that_follow_it(self, tmp_path, capsys, monkeypatch):
+        """A ruling owed must not be lost to SAMPLING.
+
+        The probe samples; it does not subscribe. The protocol tells a blocked
+        worker to keep reporting status, so the worker's own next ``WORKING:``
+        overwrites the only message a newest-message classifier reads, and the
+        debt becomes invisible on both sides: the worker holds position waiting
+        for a ruling, the conductor never learns it owes one. Nothing is
+        suppressed here and nothing is deferred -- the signal is simply never
+        observed. So ``BLOCKED`` is sticky, and a heartbeat cannot clear it.
+        """
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-blocked"])
+        self._transcript(
+            tmp_path / "sessions",
+            "s-blocked",
+            [
+                {"role": "user", "content": "seed"},
+                {"role": "assistant", "content": "BLOCKED: need a ruling on the baseline entry"},
+                {"role": "assistant", "content": "WORKING: holding position"},
+                {"role": "assistant", "content": "WORKING: still holding"},
+            ],
+        )
+        out = self._run(mod, cfg, capsys)
+        assert "BLOCKED" in out, "two heartbeats must not clear a ruling owed"
+        # A probe that did NOT mark it handled leaves it owed, so it fires again.
+        assert "BLOCKED" in self._run(mod, cfg, capsys)
+
+    def test_a_sticky_blocked_keeps_one_digest_across_new_heartbeats(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Sticky must not mean noisy. The digest is keyed on the BLOCKED report's
+        own text, so a worker that keeps filing heartbeats does not re-fire the
+        same ruling every cycle: the ruling quiets it, and only a genuinely NEW
+        blocker re-fires."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-blocked"])
+        sessions = tmp_path / "sessions"
+        rows = [
+            {"role": "user", "content": "seed"},
+            {"role": "assistant", "content": "BLOCKED: need a ruling on scope"},
+        ]
+        self._transcript(sessions, "s-blocked", rows)
+        first = self._digest_of(self._run(mod, cfg, capsys), "s-blocked")
+        # More heartbeats arrive. Same unanswered blocker, so the same digest.
+        self._transcript(
+            sessions,
+            "s-blocked",
+            rows + [{"role": "assistant", "content": "WORKING: holding position"}],
+        )
+        out = self._run(mod, cfg, capsys)
+        assert self._digest_of(out, "s-blocked") == first
+        # Delivering the ruling is what quiets it.
+        self._run(mod, cfg, capsys, "--mark-handled", "s-blocked", "BLOCKED", first)
+        assert "BLOCKED" not in self._run(mod, cfg, capsys)
+        # A genuinely new blocker is a new signal.
+        self._transcript(
+            sessions,
+            "s-blocked",
+            rows + [{"role": "assistant", "content": "BLOCKED: a second, different ruling"}],
+        )
+        assert "BLOCKED" in self._run(mod, cfg, capsys)
+
+    def test_a_real_report_clears_a_sticky_blocked(self, tmp_path, capsys, monkeypatch):
+        """Only a heartbeat is transparent. A worker that was blocked and then
+        files ``PR``/``GREEN``/``STANDDOWN`` has moved on, and continuing to
+        demand a ruling for it would manufacture the opposite error.
+
+        What is asserted is the CLEARING, not what fires in its place. A report
+        followed by a heartbeat has always been quiet -- the heartbeat is the
+        newest message -- and that is pre-existing behaviour this extension does
+        not change; ``test_a_real_report_after_a_blocker_fires_on_its_own`` covers
+        the case where the report IS the newest message.
+        """
+        mod = self._mod()
+        for tag, line in (
+            ("PR", "PR: https://x/pull/9"),
+            ("GREEN", "GREEN: https://x/pull/9 abc123 all lanes clean"),
+            ("STANDDOWN", "STANDDOWN: item withdrawn"),
+        ):
+            key = f"s-moved-{tag.lower()}"
+            cfg = self._config(tmp_path, monkeypatch, [key])
+            self._transcript(
+                tmp_path / "sessions",
+                key,
+                [
+                    {"role": "user", "content": "seed"},
+                    {"role": "assistant", "content": "BLOCKED: need a ruling"},
+                    {"role": "assistant", "content": line},
+                    {"role": "assistant", "content": "WORKING: tidying up"},
+                ],
+            )
+            out = self._run(mod, cfg, capsys)
+            assert "BLOCKED" not in out, f"{tag} must clear the ruling owed"
+            assert key not in out, f"{tag} then a heartbeat is quiet, as it always was"
+
+    def test_a_real_report_after_a_blocker_fires_on_its_own(self, tmp_path, capsys, monkeypatch):
+        """The same clearing, with the report as the newest message: the new tag
+        fires and the ruling owed is gone."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-unblocked"])
+        self._transcript(
+            tmp_path / "sessions",
+            "s-unblocked",
+            [
+                {"role": "user", "content": "seed"},
+                {"role": "assistant", "content": "BLOCKED: need a ruling"},
+                {"role": "assistant", "content": "PR: https://x/pull/9"},
+            ],
+        )
+        out = self._run(mod, cfg, capsys)
+        assert "PR" in out and "s-unblocked" in out
+        assert "BLOCKED" not in out
+
+    def test_unprefixed_text_does_not_clear_a_sticky_blocked(self, tmp_path, capsys, monkeypatch):
+        """Unprefixed text is not a report at all, so it clears nothing -- and it
+        must not let a blocked worker age into IDLE, which reads as "nudge me"
+        when the truth is "answer me"."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-blocked"], idle_alert_secs=100)
+        self._transcript(
+            tmp_path / "sessions",
+            "s-blocked",
+            [
+                {"role": "user", "content": "seed"},
+                {"role": "assistant", "content": "BLOCKED: need a ruling"},
+                {"role": "assistant", "content": "still waiting, nothing new from me"},
+            ],
+            age_secs=500,
+        )
+        out = self._run(mod, cfg, capsys)
+        assert "BLOCKED" in out
+        assert "IDLE" not in out and "TERMINAL" not in out
+
+    def test_sticky_blocked_outranks_a_recorded_terminal_disposition(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """TERMINAL and sticky BLOCKED are deliberately not the same tag: one says
+        close me, the other says a ruling is owed. A worker that stood down and
+        then found a blocker is owed the ruling, so BLOCKED wins."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-both"], idle_alert_secs=100)
+        sessions = tmp_path / "sessions"
+        self._session(sessions, "s-both", "STANDDOWN: nothing further")
+        out = self._run(mod, cfg, capsys)
+        self._run(
+            mod,
+            cfg,
+            capsys,
+            "--mark-handled",
+            "s-both",
+            "STANDDOWN",
+            self._digest_of(out, "s-both"),
+        )
+        self._transcript(
+            sessions,
+            "s-both",
+            [
+                {"role": "user", "content": "seed"},
+                {"role": "assistant", "content": "STANDDOWN: nothing further"},
+                {"role": "assistant", "content": "BLOCKED: actually, one ruling is needed"},
+                {"role": "assistant", "content": "WORKING: holding"},
+            ],
+            age_secs=500,
+        )
+        out = self._run(mod, cfg, capsys)
+        assert "BLOCKED" in out
+        assert "TERMINAL" not in out
+
+    def test_terminal_fires_once_then_suppresses_by_digest(self, tmp_path, capsys, monkeypatch):
+        """TERMINAL is an ordinary tag in the firing set: dispositioned once, it
+        goes quiet, and a NEW payload re-fires like any other."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-done"], idle_alert_secs=100)
+        sessions = tmp_path / "sessions"
+        self._session(sessions, "s-done", "PROPOSAL: https://x/issues/9")
+        out = self._run(mod, cfg, capsys)
+        self._run(
+            mod, cfg, capsys, "--mark-handled", "s-done", "PROPOSAL", self._digest_of(out, "s-done")
+        )
+        self._session(sessions, "s-done", "handing back", age_secs=500)
+        out = self._run(mod, cfg, capsys)
+        assert "TERMINAL" in out
+        self._run(
+            mod, cfg, capsys, "--mark-handled", "s-done", "TERMINAL", self._digest_of(out, "s-done")
+        )
+        assert "TERMINAL" not in self._run(mod, cfg, capsys)
+
+    def test_a_non_protocol_disposition_does_not_erase_the_terminal_tag(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The defect 2b closes: the handled set keeps ONE entry per key, so a
+        later IDLE or GONE disposition used to overwrite the terminal report and
+        the finished worker read as wedged again on the next cycle."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-done"], idle_alert_secs=100)
+        sessions = tmp_path / "sessions"
+        self._session(sessions, "s-done", "STANDDOWN: item withdrawn")
+        out = self._run(mod, cfg, capsys)
+        self._run(
+            mod,
+            cfg,
+            capsys,
+            "--mark-handled",
+            "s-done",
+            "STANDDOWN",
+            self._digest_of(out, "s-done"),
+        )
+        self._session(sessions, "s-done", "ok", age_secs=500)
+        out = self._run(mod, cfg, capsys)
+        self._run(
+            mod, cfg, capsys, "--mark-handled", "s-done", "TERMINAL", self._digest_of(out, "s-done")
+        )
+        assert self._handled(cfg)["s-done"]["proto"] == "STANDDOWN"
+        # A fresh unprefixed payload is still TERMINAL, not IDLE.
+        self._session(sessions, "s-done", "signing off for real", age_secs=500)
+        out = self._run(mod, cfg, capsys)
+        assert "TERMINAL" in out and "IDLE" not in out
+
+    def test_a_non_terminal_report_still_ages_into_idle(self, tmp_path, capsys, monkeypatch):
+        """The negative half: WORKING is not terminal, so a silent worker that
+        last said WORKING must still raise IDLE."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-wedged"], idle_alert_secs=100)
+        sessions = tmp_path / "sessions"
+        self._session(sessions, "s-wedged", "WORKING: reproducing")
+        # WORKING never fires, so dispose of it the way the conductor would:
+        # through a probe cycle that records nothing, then let the clock run.
+        self._run(mod, cfg, capsys)
+        self._session(sessions, "s-wedged", "hmm", age_secs=500)
+        out = self._run(mod, cfg, capsys)
+        assert "IDLE" in out and "TERMINAL" not in out
+
+    # ── 2c: delivery counters ─────────────────────────────────────────────────
+
+    def test_delivery_counters_appear_on_the_ok_line(self, tmp_path, capsys, monkeypatch):
+        """Load and memory can both read healthy while the fleet cannot deliver.
+        These two counters are the honest admission instrument, so they are
+        counted for every watched session -- fired or not."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-init", "s-stall", "s-fine"])
+        sessions = tmp_path / "sessions"
+        self._transcript(
+            sessions,
+            "s-init",
+            [
+                {"role": "error", "content": "initialize timed out on respawn"},
+                {"role": "assistant", "content": "WORKING: retrying"},
+            ],
+        )
+        self._transcript(
+            sessions,
+            "s-stall",
+            [
+                {"role": "inject", "content": "[Tool stall — automatic recovery] resume"},
+                {"role": "assistant", "content": "WORKING: resumed"},
+            ],
+        )
+        self._session(sessions, "s-fine", "WORKING: healthy")
+        out = self._run(mod, cfg, capsys)
+        assert "deliver init-timeout 1, watchdog 1" in out
+        assert "| foreign 0 |" in out  # 2d's counter sits before deliver
+
+    def test_delivery_patterns_are_configurable(self, tmp_path, capsys, monkeypatch):
+        mod = self._mod()
+        cfg = self._config(
+            tmp_path,
+            monkeypatch,
+            ["s-1"],
+            init_timeout_res=["never-delivered-handshake"],
+            watchdog_res=["gave-up-waiting"],
+        )
+        self._transcript(
+            tmp_path / "sessions",
+            "s-1",
+            [
+                {"role": "user", "content": "never-delivered-handshake"},
+                {"role": "assistant", "content": "WORKING: gave-up-waiting"},
+            ],
+        )
+        assert "deliver init-timeout 1, watchdog 1" in self._run(mod, cfg, capsys)
+
+    def test_a_tool_row_never_feeds_the_delivery_counters(self, tmp_path, capsys, monkeypatch):
+        """Same rule as classification: an error phrase quoted in a tool card is
+        quoted text. Measured over 60 real transcripts, no timeout or
+        stall-watchdog line ever landed on a tool row."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-1"])
+        self._transcript(
+            tmp_path / "sessions",
+            "s-1",
+            [
+                {"role": "assistant", "content": "WORKING: grepping"},
+                {"role": "tool", "content": "🔧 grep initialize timed out"},
+            ],
+        )
+        assert "deliver init-timeout 0, watchdog 0" in self._run(mod, cfg, capsys)
+
+    def test_a_bad_delivery_regex_is_malformed_config(self, tmp_path, capsys, monkeypatch):
+        """Same validation as ``err_res`` / ``banned_process_res``: a bad regex
+        is malformed config (exit 2), never a crash mid-cycle."""
+        mod = self._mod()
+        for key in ("init_timeout_res", "watchdog_res"):
+            cfg = self._config(tmp_path, monkeypatch, [], **{key: ["(unclosed"]})
+            assert mod.main(["--config", str(cfg)]) == 2, key
+            cfg = self._config(tmp_path, monkeypatch, [], **{key: [7]})
+            assert mod.main(["--config", str(cfg)]) == 2, key
+
+    # ── 2d: cwd-scoped banned scan ────────────────────────────────────────────
+
+    def _proc(self, tmp_path: Path, pid: str, argv: bytes, cwd: Path | None) -> Path:
+        """One fake ``/proc/<pid>``. ``cwd`` is written as a SYMLINK because that
+        is what the kernel exposes and what the probe reads."""
+        proc = tmp_path / "proc"
+        (proc / pid).mkdir(parents=True, exist_ok=True)
+        (proc / pid / "cmdline").write_bytes(argv)
+        if cwd is not None:
+            cwd.mkdir(parents=True, exist_ok=True)
+            os.symlink(str(cwd), str(proc / pid / "cwd"))
+        return proc
+
+    def test_a_banned_match_outside_the_fleet_is_foreign_not_banned(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """A banned command SHAPE is only a banned OPERATION when the fleet owns
+        it. The same unbounded pytest in an unrelated checkout is this machine's
+        business, and counting it made the conductor stop a worker that was not
+        the offender."""
+        mod = self._mod()
+        mine = tmp_path / "fleet" / "wt-a"
+        theirs = tmp_path / "somebody-else" / "repo"
+        proc = self._proc(tmp_path, "5001", b"python\x00-m\x00pytest\x00test/x.py\x00", mine)
+        self._proc(tmp_path, "5002", b"python\x00-m\x00pytest\x00test/y.py\x00", theirs)
+        cfg = self._config(
+            tmp_path, monkeypatch, [], fleet_worktrees=[str(tmp_path / "fleet" / "wt-a")]
+        )
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=5001 rule=" in out and "cwd=fleet" in out
+        assert "pid=5002" not in out, "an unrelated checkout is not reported"
+        assert "banned 1 | foreign 1" in out
+
+    def test_a_subdirectory_of_a_fleet_worktree_is_fleet_owned(self, tmp_path, capsys, monkeypatch):
+        """Workers run tests from inside the tree, not at its root, so the
+        comparison is prefix-wise -- and on a path BOUNDARY, so a sibling named
+        ``wt-a-old`` is not swallowed by ``wt-a``."""
+        mod = self._mod()
+        root = tmp_path / "fleet" / "wt-a"
+        proc = self._proc(tmp_path, "6001", b"pytest\x00test/x.py\x00", root / "test" / "deep")
+        self._proc(tmp_path, "6002", b"pytest\x00test/y.py\x00", tmp_path / "fleet" / "wt-a-old")
+        cfg = self._config(tmp_path, monkeypatch, [], fleet_worktrees=[str(root)])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "pid=6001" in out and "cwd=fleet" in out
+        assert "pid=6002" not in out
+        assert "banned 1 | foreign 1" in out
+
+    def test_a_windows_path_spelling_still_matches_its_fleet_root(self, tmp_path, monkeypatch):
+        """Two spellings of one directory must not read as two directories.
+
+        This class of bug is invisible on Linux and misfiled EVERY match on the
+        Windows lane: ``os.readlink`` there can answer an extended-length path
+        (``\\\\?\\D:\\...``) that no configured root will ever spell. Misfiling
+        is not cosmetic -- a fleet-owned banned run reported as ``foreign`` is
+        not printed at all, so the conductor never learns of it.
+
+        Only the platform-independent halves are asserted here. Stripping the
+        extended prefix is this script's own work, so it is pinned directly. Case
+        and separator folding is delegated to ``os.path.normcase``, which is a
+        no-op on Linux by design, so what is pinned is the DELEGATION rather than
+        Windows semantics this runner cannot exhibit.
+        """
+        mod = self._mod()
+        root = r"D:\a\KiroCrew\fleet\wt-a"
+        assert mod._norm_path("\\\\?\\" + root) == mod._norm_path(root)
+        assert mod._norm_path("\\\\?\\" + root) == os.path.normcase(os.path.normpath(root))
+        # Trailing separators and redundant segments fold on every platform.
+        assert mod._norm_path("/fleet/wt-a/") == mod._norm_path("/fleet/wt-a")
+        assert mod._norm_path("/fleet/./wt-a") == mod._norm_path("/fleet/wt-a")
+        assert mod._norm_path("/fleet/x/../wt-a") == mod._norm_path("/fleet/wt-a")
+
+    def test_a_sibling_root_is_not_swallowed_by_a_prefix_match(self, tmp_path, monkeypatch):
+        """The boundary test is a separator, not a bare prefix: ``wt-a-old`` is
+        not inside ``wt-a``, and attributing its runs to ``wt-a`` would stop the
+        wrong worker."""
+        mod = self._mod()
+        root = mod._norm_path("/fleet/wt-a")
+        assert mod._under(mod._norm_path("/fleet/wt-a"), root)
+        assert mod._under(mod._norm_path("/fleet/wt-a/test/deep"), root)
+        assert not mod._under(mod._norm_path("/fleet/wt-a-old"), root)
+        assert not mod._under(mod._norm_path("/fleet/wt-ab"), root)
+
+    def test_a_symlinked_fleet_root_still_matches(self, tmp_path, capsys, monkeypatch):
+        """A worktree reached through a symlink is the same worktree. The literal
+        comparison cannot see that, so the classifier gets a second chance
+        through ``realpath`` -- a match missed here means a banned run inside the
+        fleet is filed as somebody else's and never printed."""
+        mod = self._mod()
+        real = tmp_path / "real-fleet" / "wt-a"
+        real.mkdir(parents=True)
+        link = tmp_path / "via-link"
+        os.symlink(str(tmp_path / "real-fleet"), str(link))
+        # The process reports the REAL path; the config names the symlinked one.
+        proc = self._proc(tmp_path, "5100", b"pytest\x00test/x.py\x00", real)
+        cfg = self._config(tmp_path, monkeypatch, [], fleet_worktrees=[str(link / "wt-a")])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "pid=5100" in out and "cwd=fleet" in out
+        assert "banned 1 | foreign 0" in out
+
+    def test_an_unreadable_cwd_is_unknown_and_still_reported(self, tmp_path, capsys, monkeypatch):
+        """A process that exited between the scan and the read, or one owned by
+        another user, has no readable cwd. Dropping it would be how a real banned
+        run inside the fleet goes unreported, so unknown is reported and
+        counted."""
+        mod = self._mod()
+        proc = self._proc(tmp_path, "7001", b"pytest\x00test/x.py\x00", None)
+        cfg = self._config(tmp_path, monkeypatch, [], fleet_worktrees=[str(tmp_path / "fleet")])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=7001" in out and "cwd=unknown" in out
+        assert "banned 1 | foreign 0" in out
+
+    def test_an_undeclared_fleet_scope_reports_every_match(self, tmp_path, capsys, monkeypatch):
+        """No ``fleet_worktrees`` declares no scope. Scoping against an empty set
+        would file every match as foreign and mute the banned signal entirely --
+        a failure the conductor cannot see -- so unscoped keeps the pre-2d
+        behaviour: every match reported, every match counted."""
+        mod = self._mod()
+        proc = self._proc(tmp_path, "8001", b"pytest\x00test/x.py\x00", tmp_path / "anywhere")
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=8001" in out and "cwd=unknown" in out
+        assert "banned 1 | foreign 0" in out
+
+    def test_the_banned_line_still_withholds_argv_under_scoping(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """A command line can carry credentials or a presigned URL, and this line
+        lands in the conductor's model context. Adding the cwd class must not
+        smuggle the argv in with it."""
+        mod = self._mod()
+        mine = tmp_path / "fleet" / "wt-a"
+        proc = self._proc(
+            tmp_path, "9001", b"pytest\x00--token\x00secret-token\x00test/x.py\x00", mine
+        )
+        cfg = self._config(tmp_path, monkeypatch, [], fleet_worktrees=[str(mine)])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "pid=9001" in out
+        assert "secret-token" not in out
+
+    def test_a_relative_fleet_worktree_is_malformed_config(self, tmp_path, capsys, monkeypatch):
+        """A relative root can never match an absolute ``/proc/<pid>/cwd``
+        target, so every banned run inside the fleet would be filed as foreign.
+        Say so at load time instead of silently muting the signal."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, [], fleet_worktrees=["relative/path"])
+        assert mod.main(["--config", str(cfg)]) == 2
+        cfg = self._config(tmp_path, monkeypatch, [], fleet_worktrees=[42])
+        assert mod.main(["--config", str(cfg)]) == 2
+
+    # ── 2f: backward compatibility ────────────────────────────────────────────
+
+    def test_a_state_file_from_the_old_version_still_suppresses(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The old handled entry has no ``index`` and no ``proto``. Both are
+        additive metadata outside the digest, so an old state file must suppress
+        exactly as it did -- missing fields read as absent, never a crash."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-1"], idle_alert_secs=100)
+        self._session(tmp_path / "sessions", "s-1", "GREEN: https://x/pull/1 abc123")
+        digest = self._digest_of(self._run(mod, cfg, capsys), "s-1")
+        # Hand-write the PRE-2a entry shape, the way the old version wrote it.
+        Path(f"{cfg}.state.json").write_text(
+            json.dumps({"handled": {"s-1": {"tag": "GREEN", "digest": digest, "ts": 1}}}),
+            encoding="utf-8",
+        )
+        out = self._run(mod, cfg, capsys)
+        assert "GREEN" not in out and "0 fired" in out
+        # And an old entry records no terminal disposition, so the pre-2b
+        # reading holds: silence ages into IDLE.
+        self._session(tmp_path / "sessions", "s-1", "quiet now", age_secs=500)
+        assert "IDLE" in self._run(mod, cfg, capsys)
+
+    def test_an_old_config_with_no_new_keys_still_runs(self, tmp_path, capsys, monkeypatch):
+        """``--config`` keeps its shape: a config written before 2c/2d has no
+        delivery patterns and no fleet scope, and must still produce a full OK
+        line off the in-code defaults."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-1"])
+        self._session(tmp_path / "sessions", "s-1", "WORKING: fine")
+        out = self._run(mod, cfg, capsys)
+        assert re.search(
+            r"OK 1 watched, 0 fired \| .*\| banned 0 \| foreign 0 \| "
+            r"deliver init-timeout 0, watchdog 0",
+            out,
+        ), out
+
+    # ── standing behaviours these changes must not break ──────────────────────
+
+    def test_a_handled_idle_mark_expires_and_re_alerts(self, tmp_path, capsys, monkeypatch):
+        """An IDLE mark is the only one with an expiry: a nudged-but-still-silent
+        worker has to re-alert rather than vanish behind its own disposition."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-quiet"], idle_alert_secs=100)
+        self._session(tmp_path / "sessions", "s-quiet", "hmm", age_secs=500)
+        out = self._run(mod, cfg, capsys)
+        assert "IDLE" in out
+        self._run(
+            mod, cfg, capsys, "--mark-handled", "s-quiet", "IDLE", self._digest_of(out, "s-quiet")
+        )
+        assert "IDLE" not in self._run(mod, cfg, capsys)  # freshly marked: quiet
+        # Age the MARK past the threshold; the worker is still silent.
+        state_path = Path(f"{cfg}.state.json")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["handled"]["s-quiet"]["ts"] = int(time.time()) - 500
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        assert "IDLE" in self._run(mod, cfg, capsys)
+
+    def test_mark_handled_rejects_a_key_that_is_a_path(self, tmp_path, capsys, monkeypatch):
+        """A session key is a filename STEM. The mark path validates it too, or
+        the probe's one approved writer becomes an arbitrary-path writer."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-1"])
+        assert mod.main(["--config", str(cfg), "--mark-handled", "../../etc/x", "GREEN", "d"]) == 2
+
+    def test_the_ok_line_reports_available_memory(self, tmp_path, capsys, monkeypatch):
+        """``mem`` is read from ``MemAvailable`` in the /proc seam, so the host
+        posture half of the OK line is exercised rather than assumed."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        (proc / "meminfo").write_text(
+            "MemTotal:       65805864 kB\nMemAvailable:   12582912 kB\n", encoding="ascii"
+        )
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        assert "mem 12G" in self._run(mod, cfg, capsys)
+
+    def test_block_shaped_content_classifies_like_a_string(self, tmp_path, capsys, monkeypatch):
+        """A row whose ``content`` is a list of text blocks is read by joining the
+        blocks. Real transcripts on this host carry plain strings, so this is the
+        defensive path -- pinned so a writer that starts emitting blocks does not
+        silently read as a session with nothing to say."""
+        mod = self._mod()
+        cfg = self._config(tmp_path, monkeypatch, ["s-blocks"])
+        self._transcript(
+            tmp_path / "sessions",
+            "s-blocks",
+            [
+                {"role": "user", "content": "seed"},
+                {"role": "assistant", "content": [{"text": "BLOCKED: need a ruling"}]},
+            ],
+        )
+        out = self._run(mod, cfg, capsys)
+        assert "BLOCKED" in out and "s-blocks" in out
 
 
 class TestCreditSpend:
