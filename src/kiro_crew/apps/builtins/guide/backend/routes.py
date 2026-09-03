@@ -69,9 +69,7 @@ async def handle_list_entries(request: web.Request) -> web.StreamResponse:
     platform = request.query.get("platform") or None
     topic = request.query.get("topic") or None
     limit = _query_int(request, "limit", default=25, low=1, high=50)
-    results = await asyncio.to_thread(
-        search.search, q, platform=platform, topic=topic, limit=limit
-    )
+    results = await asyncio.to_thread(search.search, q, platform=platform, topic=topic, limit=limit)
     return web.json_response({"entries": results, "total": len(results)})
 
 
@@ -93,9 +91,7 @@ async def handle_get_media(request: web.Request) -> web.StreamResponse:
     key = request.match_info["key"]
     path = await asyncio.to_thread(search.resolve_media, key)
     if path is None:
-        return web.json_response(
-            {"error": "media not found", "code": "not_found"}, status=404
-        )
+        return web.json_response({"error": "media not found", "code": "not_found"}, status=404)
     ctype, _ = mimetypes.guess_type(str(path))
     return web.FileResponse(path, headers={"Content-Type": ctype or "application/octet-stream"})
 

@@ -99,7 +99,7 @@ export default function GuidePage() {
             <span className="font-semibold text-sm">{t('apps.guide.title')}</span>
           </div>
           <div
-            className="flex items-center gap-2 px-3 py-2 rounded-lg"
+            className="flex items-center gap-2 px-3 py-2 rounded-lg focus-within:ring-1 focus-within:ring-[var(--accent)]"
             style={{ border: '1px solid var(--border)', background: 'var(--card)' }}
           >
             <Search size={15} style={{ color: 'var(--muted)' }} />
@@ -107,6 +107,7 @@ export default function GuidePage() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder={t('apps.guide.searchPlaceholder')}
+              aria-label={t('apps.guide.searchPlaceholder')}
               className="flex-1 bg-transparent outline-none text-sm"
               style={{ color: 'var(--text)' }}
             />

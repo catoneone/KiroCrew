@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 logger = logging.getLogger("kirocrew.app.guide")
@@ -133,9 +133,7 @@ def _read_json_obj(path: Path) -> Any:
         return None
 
 
-def _apply_whole(
-    by_id: dict[str, dict[str, Any]], order: list[str], entries: Any
-) -> None:
+def _apply_whole(by_id: dict[str, dict[str, Any]], order: list[str], entries: Any) -> None:
     """Append whole entries (append-or-replace by id). Non-dicts/idless skipped."""
     if not isinstance(entries, list):
         return
@@ -208,9 +206,7 @@ def _entries() -> list[dict[str, Any]]:
             overlay_raw = _read_json_obj(_overlay_json_path()) if mtime is not None else None
             _merged_cache = _compose(base, overlay_raw)
             _overlay_mtime = mtime
-            logger.info(
-                "guide: composed %d entries (%d base)", len(_merged_cache), len(base)
-            )
+            logger.info("guide: composed %d entries (%d base)", len(_merged_cache), len(base))
         return _merged_cache
 
 
@@ -344,7 +340,10 @@ def resolve_media(key: str) -> Path | None:
     key that escapes returns None.
     """
     key = (key or "").strip().lstrip("/")
-    if not key or ".." in key.replace("\\", "/").split("/"):
+    # Reject traversal by inspecting the key's path components (PurePosixPath,
+    # since a media key is always '/'-delimited) rather than assembling '/' by
+    # hand; the resolve()+relative_to containment below is the real guard.
+    if not key or ".." in PurePosixPath(key).parts:
         return None
     for root in (_overlay_dir() / _OVERLAY_MEDIA_SUBDIR, _BASE_MEDIA_DIR):
         try:
