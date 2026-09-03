@@ -351,6 +351,74 @@ class TestLegitimateUpdatesStillHappen:
         assert not (user / _PROVENANCE_MARKER).exists()
         assert "USER own" in (user / "SKILL.md").read_text(encoding="utf-8")
 
+    def test_script_only_package_update_reaches_the_install(
+        self, builtin_root: Path, base: Path
+    ) -> None:
+        # The manifest is NOT a version stamp for the skill. A release that
+        # only touches a bundled script leaves SKILL.md byte-identical with its
+        # packaged mtime, and a manifest-only update gate then reports "up to
+        # date" forever -- the install keeps executing superseded code. Broke
+        # prepare-pr in practice: its extractor was fixed in the package while
+        # every install kept the previous copy and failed against CI's current
+        # workflow.
+        src = _make_skill(builtin_root, "helper", "v1", {"scripts/tool.py": "# v1"})
+        _ensure_builtin_skills(base)
+        assert (base / "helper" / "scripts" / "tool.py").read_text(encoding="utf-8") == "# v1"
+
+        script = src / "scripts" / "tool.py"
+        script.write_text("# v2", encoding="utf-8")
+        _bump_mtime(script)
+        manifest_mtime = (src / "SKILL.md").stat().st_mtime
+
+        _ensure_builtin_skills(base)
+
+        assert (base / "helper" / "scripts" / "tool.py").read_text(encoding="utf-8") == "# v2"
+        # The manifest genuinely never moved, so the update cannot have come
+        # from the manifest arm of the gate.
+        assert (src / "SKILL.md").stat().st_mtime == manifest_mtime
+        assert not os.path.lexists(base / ".helper.user-backup")
+
+    def test_provenance_marker_mtime_cannot_suppress_an_update(
+        self, builtin_root: Path, base: Path
+    ) -> None:
+        # The marker is written AFTER the copy, so its mtime is install time.
+        # Counting it would make every destination newer than the package it
+        # came from and the tree arm would never fire again.
+        src = _make_skill(builtin_root, "helper", "v1", {"scripts/tool.py": "# v1"})
+        _ensure_builtin_skills(base)
+        _bump_mtime(base / "helper" / _PROVENANCE_MARKER, seconds=600.0)
+
+        script = src / "scripts" / "tool.py"
+        script.write_text("# v2", encoding="utf-8")
+        _bump_mtime(script)
+
+        _ensure_builtin_skills(base)
+
+        assert (base / "helper" / "scripts" / "tool.py").read_text(encoding="utf-8") == "# v2"
+
+    def test_unchanged_install_is_not_recopied_each_sync(
+        self, builtin_root: Path, base: Path
+    ) -> None:
+        # Widening the gate must not make a steady state churn: copytree copies
+        # with copy2, so an untouched install is mtime-equal to its package and
+        # nothing is due. A re-copy would rotate the retirement slot on every
+        # startup, quietly discarding the previous cycle's parked tree.
+        _make_skill(
+            builtin_root,
+            "helper",
+            "v1",
+            # A script NEWER than the manifest is the ordinary packaged shape,
+            # and the one that would loop if the tree arm compared the source's
+            # newest file against the destination's manifest.
+            {"scripts/tool.py": "# v1"},
+        )
+        _bump_mtime(builtin_root / "helper" / "scripts" / "tool.py")
+        _ensure_builtin_skills(base)
+
+        _ensure_builtin_skills(base)
+
+        assert not os.path.lexists(base / ".helper.superseded")
+
 
 class TestFingerprint:
     """The fingerprint covers the full tree, excludes only the marker, and can
