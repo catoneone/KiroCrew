@@ -1880,21 +1880,52 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
             messages = mem_msgs
         total = len(messages)
         has_more = False
-        # This branch returns the whole corpus, so there is no older page to ask
-        # for. Sent anyway so the field is present on every response shape.
+        # This branch returns the whole UN-ARCHIVED corpus. Rows a size
+        # rotation moved into archive/ are NOT in it — so when such rows
+        # exist, advertise them: `next_before` is their collapsed row count,
+        # i.e. the boundary index (in the paginated corpus, which prepends the
+        # archived head) of this response's first row. The client's next
+        # "load earlier" then pages straight into the archived head instead of
+        # this response permanently retiring the affordance. Collapsed in the
+        # same units the paginated path slices in; a chunk run split by the
+        # rotation cut can make this off by one, which the client's mid-dedupe
+        # absorbs. Multi-key chains with mid-chain rotations make the boundary
+        # approximate the same way — continued paging self-corrects, losing a
+        # page-worth of overlap at worst, never rows.
         next_before = 0
+        if state.conversation_log:
+            try:
+                rotated = await asyncio.to_thread(
+                    state.conversation_log.read_rotated_messages_chained,
+                    slot_history_key(slot),
+                )
+            except Exception:
+                logger.warning("rotated-archive read failed", exc_info=True)
+                rotated = []
+            if rotated:
+                rotated_count = len(_collapse_wire_rows(rotated))
+                if rotated_count > 0:
+                    has_more = True
+                    next_before = rotated_count
+                    total += rotated_count
     else:
         # Legacy pagination path (retained for programmatic callers).
         # Always reads from chained disk history; no in-memory offset math.
+        # The FULL corpus — size-rotated archive heads included — so paging can
+        # walk past a rotation boundary instead of declaring the transcript
+        # complete at it (the reader's oldest messages live in archive/ after
+        # a big session rotates, and this path is their only way back in).
         history_key = slot_history_key(slot)
         try:
             all_msgs = (
-                await asyncio.to_thread(state.conversation_log.read_messages_chained, history_key)
+                await asyncio.to_thread(
+                    state.conversation_log.read_messages_chained_full, history_key
+                )
                 if state.conversation_log
                 else []
             )
         except Exception:
-            logger.warning("read_messages_chained failed for %s", history_key, exc_info=True)
+            logger.warning("read_messages_chained_full failed for %s", history_key, exc_info=True)
             all_msgs = []
         # Append any un-flushed in-memory tail messages beyond what's on disk.
         # Snapshot on the LOOP, after the disk read: the two reads inside the helper

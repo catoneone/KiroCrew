@@ -623,6 +623,29 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+    # Fork indices arrive in the PAGINATED corpus's visible-row space, which
+    # prepends each chain key's size-rotated archive head
+    # (read_messages_chained_full). Prepend the same rotated rows here, or
+    # every index sent after the reader paged past a rotation boundary
+    # resolves short by the archived visible-row count, silently forking the
+    # WRONG message — and archived rows could not be forked at all. Rotated
+    # rows are BY DEFINITION no longer in the live files, so this cannot
+    # duplicate anything the flush arms above already placed in
+    # ``all_messages``. Known limit: a multi-key tab chain whose non-first
+    # keys also rotated interleaves rot/live per key in the paginated corpus,
+    # while this flat prepend puts all rotated rows first — the index spaces
+    # then disagree by the affected rows only.
+    if state.conversation_log:
+        try:
+            _rotated_head = await asyncio.to_thread(
+                state.conversation_log.read_rotated_messages_chained,
+                slot_history_key(slot),
+            )
+        except Exception:
+            logger.warning("rotated-archive read failed for fork", exc_info=True)
+            _rotated_head = []
+        if _rotated_head:
+            all_messages = _rotated_head + all_messages
     visible = [m for m in all_messages if m.get("role") in ("user", "assistant")]
     if not visible:
         return web.json_response(

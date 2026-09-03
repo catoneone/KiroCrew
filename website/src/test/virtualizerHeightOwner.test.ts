@@ -81,7 +81,7 @@ describe('height truth has one owner (structural)', () => {
     // make this ratchet fail for edits that have nothing to do with the
     // invariant -- and would let an unrelated guard being added read as a
     // height regression.
-    const heightGuards = code.match(/heightIndexRef\.current\?\.sessionId\s*!==\s*sessionId/g) ?? []
+    const heightGuards = code.match(/heightIndexRef\.current\?\.sessionId\s*!==\s*heightScope/g) ?? []
     expect(heightGuards).toHaveLength(1)
     // Session identity has ONE record, on the owner. Any parallel ref beside it
     // is a second spelling that can drift from the owner it describes -- the
@@ -130,6 +130,30 @@ describe('HeightIndex read surface (behavioural)', () => {
       keyAt: (i) => keys[i] ?? null,
     })
   }
+
+  it('height scope defaults to sessionId (heightScopeKey is opt-in)', () => {
+    // The guard reads heightScope = heightScopeKey ?? sessionId. This pins the
+    // fallback so callers without width-dependent rows keep byte-identical
+    // behavior.
+    const code = stripComments(readSource('useVirtualChat.ts'))
+    expect(code).toMatch(/const heightScope = heightScopeKey \?\? sessionId/)
+  })
+
+  it('consults estimateAt for unmeasured rows, and a measurement beats it', () => {
+    const priced = new Map([[1, 4000]])
+    const idx = new HeightIndex(`price-${Math.random()}`, {
+      rowCount: 3,
+      estimate: ESTIMATE,
+      keyAt: (i) => `k${i}`,
+      estimateAt: (i) => priced.get(i),
+    })
+    // Unpriced rows keep the flat/mean fallback; the priced row pre-sizes.
+    expect(idx.getHeight(0)).toBe(ESTIMATE)
+    expect(idx.getHeight(1)).toBe(4000)
+    // A real measurement always wins over the price.
+    idx.setMeasured(1, 3200)
+    expect(idx.getHeight(1)).toBe(3200)
+  })
 
   it('separates "how tall is this row" from "has this row been measured"', () => {
     const idx = makeIndex(`sep-${Math.random()}`, ['a', 'b'])
