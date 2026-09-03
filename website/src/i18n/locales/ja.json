@@ -5339,7 +5339,9 @@
       "auto_compact_threshold": "自動圧縮のしきい値",
       "auto_compact_load_failed": "自動圧縮の設定を読み込めませんでした",
       "reset_to_global": "グローバル設定に戻す（{{pct}}%）",
-      "following_global": "グローバル設定に従う（{{pct}}%）"
+      "following_global": "グローバル設定に従う（{{pct}}%）",
+      "sketch": "スケッチ",
+      "sketch_desc": "ワイヤーフレームを描いて添付する"
     },
     "chatPane": {
       "agent_list": "エージェントリスト",
@@ -7538,6 +7540,14 @@
       "path_copied": "パスをコピーしました",
       "reveal_blocked": "このパスは保護されているため開けません。",
       "reveal_failed": "{{productName}} を実行しているマシンでこのパスを開けませんでした。"
+    },
+    "sketchDialog": {
+      "title": "スケッチパッド",
+      "draw_something_first": "まず何か描いてください",
+      "loading": "スケッチパッドを読み込み中…",
+      "export_failed": "スケッチを書き出せませんでした。もう一度お試しください",
+      "insert_hint": "画像と .excalidraw ソースを添付します（Excalidraw で編集可能）",
+      "attach_to_message": "メッセージに添付"
     }
   },
   "hooks": {

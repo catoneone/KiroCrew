@@ -5428,7 +5428,9 @@
       "auto_compact_threshold": "অটো-কম্প্যাক্ট থ্রেশহোল্ড",
       "auto_compact_load_failed": "অটো-কম্প্যাক্ট সেটিং লোড করা যায়নি",
       "reset_to_global": "গ্লোবালে রিসেট করুন ({{pct}}%)",
-      "following_global": "গ্লোবাল অনুসরণ করছে ({{pct}}%)"
+      "following_global": "গ্লোবাল অনুসরণ করছে ({{pct}}%)",
+      "sketch": "স্কেচ",
+      "sketch_desc": "দ্রুত ওয়্যারফ্রেম আঁকুন এবং সংযুক্ত করুন"
     },
     "chatPane": {
       "agent_list": "এজেন্ট তালিকা",
@@ -7644,6 +7646,14 @@
       "path_copied": "পাথ কপি করা হয়েছে",
       "reveal_blocked": "এই পাথটি সুরক্ষিত এবং খোলা যাবে না।",
       "reveal_failed": "{{productName}} চালানো মেশিনে এই পাথটি খোলা যায়নি।"
+    },
+    "sketchDialog": {
+      "title": "স্কেচ প্যাড",
+      "draw_something_first": "আগে কিছু আঁকুন",
+      "loading": "স্কেচ প্যাড লোড হচ্ছে…",
+      "export_failed": "স্কেচ রপ্তানি করা যায়নি — আবার চেষ্টা করুন",
+      "insert_hint": "ছবি এবং এর .excalidraw উৎস সংযুক্ত করে (Excalidraw-এ সম্পাদনাযোগ্য)",
+      "attach_to_message": "বার্তায় সংযুক্ত করুন"
     }
   },
   "hooks": {

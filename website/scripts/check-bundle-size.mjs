@@ -94,6 +94,22 @@ export const CHUNK_BUDGETS = {
   // gate reports as unused).
   'chunk-KEIR6QF5': 680 * KB, // measured 647 KB (mermaid 11.16.1)
 
+  // Excalidraw whiteboard (@excalidraw/excalidraw 0.18.1), reached ONLY through
+  // SketchDialog's lazy `import()` when the composer's sketch pad opens — none
+  // of these three chunks is statically imported or modulepreloaded (the entry
+  // graph is unchanged; verified by grepping the built App chunk and
+  // dist/index.html). Their sizes are the vendor's, not ours, and change only
+  // with an Excalidraw upgrade — re-measure and rename these entries then, the
+  // same maintenance contract as the mermaid entry above.
+  //
+  // `prod` is Excalidraw's main module (named after its dist/prod/index.js);
+  // the two hash-named chunks are its font-subsetting payload for PNG/SVG
+  // export (the large one is embedded font data) plus internals shared with
+  // the subsetting worker.
+  prod: 560 * KB, // measured 534 KB (@excalidraw/excalidraw 0.18.1)
+  'chunk-EIO257PC': 1830 * KB, // measured 1744 KB (excalidraw 0.18.1 embedded font data, worker-loaded)
+  'chunk-K2UTITRG': 550 * KB, // measured 522 KB (excalidraw 0.18.1 font-subsetting internals)
+
   // Graph/network visualization stack (vis-network, sigma, graphology,
   // cytoscape) -- one deliberate `manualChunks` bucket, see vite.config.ts.
   'vendor-graph': 606 * KB, // measured 577 KB

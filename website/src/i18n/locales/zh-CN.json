@@ -5339,7 +5339,9 @@
       "auto_compact_threshold": "自动压缩阈值",
       "auto_compact_load_failed": "无法加载自动压缩设置",
       "reset_to_global": "重置为全局设置（{{pct}}%）",
-      "following_global": "跟随全局设置（{{pct}}%）"
+      "following_global": "跟随全局设置（{{pct}}%）",
+      "sketch": "草图",
+      "sketch_desc": "快速画个草图并附到消息里"
     },
     "chatPane": {
       "agent_list": "代理列表",
@@ -7538,6 +7540,14 @@
       "path_copied": "路径已复制",
       "reveal_blocked": "此路径受保护，无法打开。",
       "reveal_failed": "无法在运行 {{productName}} 的计算机上打开此路径。"
+    },
+    "sketchDialog": {
+      "title": "草图板",
+      "draw_something_first": "先画点什么吧",
+      "loading": "正在加载草图板…",
+      "export_failed": "草图导出失败，请重试",
+      "insert_hint": "同时附上图片和 .excalidraw 源文件（可在 Excalidraw 中编辑，crew 可读取结构）",
+      "attach_to_message": "附加到消息"
     }
   },
   "hooks": {

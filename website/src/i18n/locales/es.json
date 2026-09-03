@@ -5517,7 +5517,9 @@
       "auto_compact_threshold": "Umbral de compactación automática",
       "auto_compact_load_failed": "No se pudo cargar el ajuste de compactación automática",
       "reset_to_global": "Restablecer al global ({{pct}}%)",
-      "following_global": "Sigue el global ({{pct}}%)"
+      "following_global": "Sigue el global ({{pct}}%)",
+      "sketch": "Boceto",
+      "sketch_desc": "Dibuja un boceto rápido y adjúntalo"
     },
     "chatPane": {
       "agent_list": "Lista de agentes",
@@ -7750,6 +7752,14 @@
       "path_copied": "Ruta copiada",
       "reveal_blocked": "Esta ruta está protegida y no se puede abrir.",
       "reveal_failed": "No se pudo abrir esta ruta en el equipo donde se ejecuta {{productName}}."
+    },
+    "sketchDialog": {
+      "title": "Bloc de bocetos",
+      "draw_something_first": "Dibuja algo primero",
+      "loading": "Cargando el bloc de bocetos…",
+      "export_failed": "No se pudo exportar el boceto; inténtalo de nuevo",
+      "insert_hint": "Adjunta la imagen y su fuente .excalidraw (editable en Excalidraw)",
+      "attach_to_message": "Adjuntar al mensaje"
     }
   },
   "hooks": {
